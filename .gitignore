@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.DS_Store
+output/
+venv/
+*.pid
+*.log
+.webui_secret_key
