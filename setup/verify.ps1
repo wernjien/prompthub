@@ -5,8 +5,8 @@
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $HomeDir = if ($env:PROMPTHUB_HOME) { $env:PROMPTHUB_HOME } else { "$HOME\PromptHub" }
 $VenvPython = "$HomeDir\venv\Scripts\python.exe"
-$TextModel = "dolphin3:8b"
-$VisionModel = "llava:13b"
+$TextModel = if ($env:PROMPTHUB_TEXT_MODEL) { $env:PROMPTHUB_TEXT_MODEL } else { "dolphin3:8b" }
+$VisionModel = if ($env:PROMPTHUB_VISION_MODEL) { $env:PROMPTHUB_VISION_MODEL } else { "llava:13b" }
 $PassCount = 0
 $FailCount = 0
 

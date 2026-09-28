@@ -1,26 +1,20 @@
 #!/usr/bin/env bash
-# PromptHub acceptance-criteria checks — macOS / Linux (see requirements.md
-# Section 8, adapted for the Docker-free Functions architecture — see
-# README.md "Architecture note"). Run after setup/install_<os>.sh or
-# setup/start.sh (both seed Open WebUI automatically, no manual UI steps).
+# PromptHub acceptance checks (macOS / Linux); run after setup/install_<os>.sh or setup/start.sh.
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HOME_DIR="${PROMPTHUB_HOME:-$HOME/PromptHub}"
 VENV_DIR="$HOME_DIR/venv"
 
-TEXT_MODEL="dolphin3:8b"
-VISION_MODEL="llava:13b"
+TEXT_MODEL="${PROMPTHUB_TEXT_MODEL:-dolphin3:8b}"
+VISION_MODEL="${PROMPTHUB_VISION_MODEL:-llava:13b}"
 PASS=0
 FAIL=0
 
 pass() { echo "  PASS: $1"; PASS=$((PASS + 1)); }
 fail() { echo "  FAIL: $1"; FAIL=$((FAIL + 1)); }
 
-# `ollama list`/`ollama ps` have been observed to transiently omit a row
-# under memory pressure (see README "Known risks" on 16GB being tight with
-# two large models loaded) — retry the match a few times before treating an
-# absence as real.
+# `ollama list`/`ollama ps` can transiently omit a row under memory pressure, so retry before failing.
 retry_grep() {
   local pattern="$1"; shift
   local out=""
@@ -41,10 +35,7 @@ if retry_grep "$TEXT_MODEL" ollama list >/dev/null; then pass "$TEXT_MODEL pulle
 if retry_grep "$VISION_MODEL" ollama list >/dev/null; then pass "$VISION_MODEL pulled"; else fail "$VISION_MODEL missing — run: ollama pull $VISION_MODEL"; fi
 
 echo "== 2. GPU utilization (not CPU fallback) =="
-# Generate once and wait for it to finish, rather than racing a background
-# request: the model stays resident for ollama's keep-alive window
-# afterwards, so 'ollama ps' can be read with no timing window to miss. A
-# cold model can take tens of seconds to load, which no short sleep covers.
+# Generate to completion first; the model then stays resident, so `ollama ps` can't miss it.
 for model in "$TEXT_MODEL" "$VISION_MODEL"; do
   echo "  (loading $model — first run can take a minute)"
   if curl -sf -m 300 http://localhost:11434/api/generate \

@@ -5,8 +5,8 @@ set -euo pipefail
 HOME_DIR="${PROMPTHUB_HOME:-$HOME/PromptHub}"
 OUTPUT_DIR="$HOME_DIR/output"
 VENV_DIR="$HOME_DIR/venv"
-TEXT_MODEL="dolphin3:8b"
-VISION_MODEL="llava:13b"
+TEXT_MODEL="${PROMPTHUB_TEXT_MODEL:-dolphin3:8b}"
+VISION_MODEL="${PROMPTHUB_VISION_MODEL:-llava:13b}"
 
 echo "==> Installing Ollama"
 if ! command -v ollama >/dev/null; then
@@ -44,8 +44,9 @@ if command -v systemctl >/dev/null && systemctl list-unit-files | grep -q ollama
   sudo systemctl enable --now ollama
 else
   nohup ollama serve >/tmp/ollama.log 2>&1 &
-  sleep 2
 fi
+for _ in $(seq 1 30); do ollama list >/dev/null 2>&1 && break; sleep 1; done
+ollama list >/dev/null 2>&1 || { echo "Ollama didn't start within 30s — start it manually and re-run"; exit 1; }
 
 echo "==> Pulling models: $TEXT_MODEL, $VISION_MODEL"
 ollama pull "$TEXT_MODEL"

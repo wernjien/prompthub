@@ -5,8 +5,8 @@ set -euo pipefail
 HOME_DIR="${PROMPTHUB_HOME:-$HOME/PromptHub}"
 OUTPUT_DIR="$HOME_DIR/output"
 VENV_DIR="$HOME_DIR/venv"
-TEXT_MODEL="dolphin3:8b"
-VISION_MODEL="llava:13b"
+TEXT_MODEL="${PROMPTHUB_TEXT_MODEL:-dolphin3:8b}"
+VISION_MODEL="${PROMPTHUB_VISION_MODEL:-llava:13b}"
 
 command -v brew >/dev/null || { echo "Homebrew is required: https://brew.sh"; exit 1; }
 
@@ -17,7 +17,8 @@ brew list python@3.11 >/dev/null 2>&1 || brew install python@3.11
 
 echo "==> Starting Ollama"
 brew services start ollama >/dev/null 2>&1 || true
-sleep 2
+for _ in $(seq 1 30); do ollama list >/dev/null 2>&1 && break; sleep 1; done
+ollama list >/dev/null 2>&1 || { echo "Ollama didn't start within 30s — start it manually and re-run"; exit 1; }
 
 echo "==> Pulling models: $TEXT_MODEL, $VISION_MODEL"
 ollama pull "$TEXT_MODEL"

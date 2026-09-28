@@ -5,8 +5,8 @@ $ErrorActionPreference = "Stop"
 $HomeDir = if ($env:PROMPTHUB_HOME) { $env:PROMPTHUB_HOME } else { "$HOME\PromptHub" }
 $OutputDir = "$HomeDir\output"
 $VenvDir = "$HomeDir\venv"
-$TextModel = "dolphin3:8b"
-$VisionModel = "llava:13b"
+$TextModel = if ($env:PROMPTHUB_TEXT_MODEL) { $env:PROMPTHUB_TEXT_MODEL } else { "dolphin3:8b" }
+$VisionModel = if ($env:PROMPTHUB_VISION_MODEL) { $env:PROMPTHUB_VISION_MODEL } else { "llava:13b" }
 
 # winget updates the machine/user PATH in the registry, but this process's
 # $env:Path is a snapshot taken at startup - without refreshing it here,

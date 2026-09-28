@@ -170,19 +170,30 @@ preference — so you don't pick it:
 Every reply says which mode it used and why. **To force one, just say so** —
 "use L2VA" beats the inference.
 
+**Clip length.** H3 generates 4–15 second clips. A length you type (`[6s]`,
+"10 seconds", "a 5-second clip") always wins. Otherwise an attached clip's
+own length is used, clamped into 4–15s, and the footer says when it was
+clamped. With neither, the writer picks (6s by default).
+
+**One source per message.** Attach either one clip or images, not both. And
+if any attachment can't be read, nothing is generated: quietly dropping one
+of two FL2VA images would otherwise turn it into an I2VA prompt without
+telling you.
+
 ### Reference frames get saved for you
 
 For I2VA / FL2VA / L2VA, MiniMax needs the actual image(s) as well as the
 prompt. PromptHub saves them to `~/PromptHub/output/` and prints the paths:
 
 ```
-Reference frame (Picture 1, t=0) saved to: /Users/you/PromptHub/output/picture1_1789795684.jpg
+Reference frame (Picture 1, t=0) saved to: /Users/you/PromptHub/output/picture1_1789795684_3fa2c1.jpg
 Supply these to your MiniMax generation alongside the prompt above.
 ```
 
-If you attached an image, that image is saved. If you attached a clip, the
-relevant frames are pulled from it. If you attached nothing, it tells you
-so rather than leaving you to discover it later.
+If you attached an image, that image is saved in its own format (png stays
+png). If you attached a clip, the relevant frames are pulled from it. If you
+attached nothing, it tells you so rather than leaving you to discover it
+later. Files from one reply share a suffix, so an FL2VA pair is easy to spot.
 
 ### Prompts never refer back to your attachment
 
@@ -221,27 +232,57 @@ always safe.
 ## 5. Configuration
 
 Each Function reads settings from Open WebUI's **Valves** panel (Admin
-Panel → Functions → ⚙️), or environment variables of the same name set
-before `open-webui serve`:
+Panel → Functions → ⚙️). The defaults come from the environment variable in
+the second column, if it's set before `open-webui serve`:
 
-| Valve | Default | Purpose |
-|---|---|---|
-| `OLLAMA_BASE_URL` | `http://localhost:11434` | Where Ollama is reachable |
-| `TEXT_MODEL` | `dolphin3:8b` | Writes the final prompt |
-| `VISION_MODEL` | `llava:13b` | Describes your attachments |
-| `FRAME_COUNT` | `4` | Frames sampled per clip. Plus the final frame that's 5 images — read the vision-budget limit below before raising it |
-| `MAX_VISION_IMAGES` | `5` | Hard cap on images sent to the vision model; extras are subsampled rather than erroring |
-| `VISION_NUM_CTX` | `8192` | Context for the vision call. Improves its reasoning, but does **not** raise the image budget |
-| `REFERENCE_FRAME_DIR` | `~/PromptHub/output` | Where reference frames are saved |
-| `REQUEST_TIMEOUT_SECONDS` | `300` | Per-call timeout to Ollama |
+| Valve | Env var | Default | Purpose |
+|---|---|---|---|
+| `OLLAMA_BASE_URL` | `OLLAMA_BASE_URL` | `http://localhost:11434` | Where Ollama is reachable |
+| `TEXT_MODEL` | `PROMPTHUB_TEXT_MODEL` | `dolphin3:8b` | Writes the final prompt |
+| `VISION_MODEL` | `PROMPTHUB_VISION_MODEL` | `llava:13b` | Describes your attachments |
+| `FRAME_COUNT` | `PROMPTHUB_FRAME_COUNT` | `4` | Frames sampled per clip. Plus the final frame that's 5 images — read the vision-budget limit below before raising it |
+| `MAX_VISION_IMAGES` | `PROMPTHUB_MAX_VISION_IMAGES` | `5` | Hard cap on images sent to the vision model; extras are subsampled rather than erroring |
+| `VISION_NUM_CTX` | `PROMPTHUB_VISION_NUM_CTX` | `8192` | Context for the vision call. Ollama caps it at the model's own limit (4096 for `llava:13b`), and it does **not** raise the image budget |
+| `TEXT_NUM_CTX` | `PROMPTHUB_TEXT_NUM_CTX` | `8192` | Context for the writing call. The system prompt plus a long caption can overflow Ollama's default, which truncates silently |
+| `FFMPEG_BINARY` / `FFPROBE_BINARY` | `PROMPTHUB_FFMPEG_BINARY` / `PROMPTHUB_FFPROBE_BINARY` | `ffmpeg` / `ffprobe` | Paths to the tools, if they aren't on `PATH` |
+| `REFERENCE_FRAME_DIR` | `PROMPTHUB_REFERENCE_FRAME_DIR` | `~/PromptHub/output` | Where reference frames are saved |
+| `REQUEST_TIMEOUT_SECONDS` | `PROMPTHUB_REQUEST_TIMEOUT_SECONDS` | `300` | Per-call timeout to Ollama |
+
+The install and verify scripts honour `PROMPTHUB_TEXT_MODEL` and
+`PROMPTHUB_VISION_MODEL` too, so set them before installing to pull and
+check a different model.
+
+### Better performance
+
+Nearly all the time goes to model loading and the vision pass, not to
+PromptHub itself. In rough order of payoff:
+
+- **Pick a vision model that fits next to the writer.** On 16GB, macOS lets
+  the GPU use roughly 10–11GB, and `dolphin3:8b` takes 5.6GB of that. A vision
+  model under about 5GB (for example `llava:7b` or `qwen2.5vl:3b`) keeps both
+  loaded, so there's no swap on every attachment reply. Try one with
+  `PROMPTHUB_VISION_MODEL` and compare the captions first: smaller models
+  describe less.
+- **Sample fewer frames.** `FRAME_COUNT=2` sends 3 images instead of 5, which
+  roughly halves the time `llava:13b` spends reading a clip.
+- **Keep models loaded longer.** Ollama unloads an idle model after 5
+  minutes. Setting `OLLAMA_KEEP_ALIVE=30m` for the Ollama service avoids the
+  reload when you come back between prompts.
+
+Open WebUI also asks the selected model to write chat titles, tags and
+follow-up suggestions. PromptHub answers those instantly without calling
+Ollama (the chat is titled with your first message), so they cost nothing.
 
 ---
 
 ## 6. Troubleshooting
 
-**First reply after a while is slow.** Normal — Ollama loads the model into
-memory on first use, then it's fast until it idles out. A clip is slower
-still: frame extraction plus a vision pass before the writing pass.
+**Replies are slow, especially with an attachment.** Ollama loads each model
+into memory on first use. On a 16GB machine `llava:13b` (9.3GB) and
+`dolphin3:8b` (5.6GB) don't fit together, so every attachment reply unloads
+one and loads the other (about 15s of loading), and the next text-only
+reply reloads the writer. A clip adds about a minute for `llava:13b` to read
+its 5 frames. See "Better performance" below for ways round this.
 
 **"You attached a file, but it couldn't be read."** The attachment didn't
 resolve to something readable. Re-encode to mp4, or just describe it in

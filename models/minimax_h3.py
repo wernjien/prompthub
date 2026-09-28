@@ -1,17 +1,13 @@
 """
 title: MiniMax H3
 author: PromptHub
-version: 0.7.0
+version: 0.8.0
 license: MIT
-description: >
-    Writes a MiniMax H3 video prompt from a typed idea, an attached image or
-    clip, or both. Picks the H3 mode (T2VA / I2VA / FL2VA / L2VA) from what
-    you actually supplied instead of making you choose, reports which it
-    used, and saves any reference frames that mode needs. Runs in-process
-    inside Open WebUI and talks straight to Ollama on localhost.
+description: Writes a MiniMax H3 video prompt from typed text, an attached image or clip, or both, inferring the mode (T2VA / I2VA / FL2VA / L2VA) and saving any reference frames it needs.
 requirements: requests
 """
 
+import asyncio
 import base64
 import glob
 import inspect
@@ -21,17 +17,13 @@ import shutil
 import subprocess
 import tempfile
 import time
+import uuid
 from typing import List, Optional, Tuple
 
 import requests
 from pydantic import BaseModel
 
-VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v", ".mpg", ".mpeg"}
-
-# The four H3 modes differ only in which reference frames you hand the
-# generator, which in turn changes the required alignment line. That is a
-# fact about your inputs rather than a preference, so it's inferred here
-# instead of being a menu the user has to understand.
+# Which reference frames each mode hands the generator.
 REFERENCE_POLICY = {"t2va": "none", "i2va": "first", "fl2va": "first_last", "l2va": "last"}
 
 MODE_REASON = {
@@ -41,15 +33,20 @@ MODE_REASON = {
     "l2va": "one reference image, treated as the closing frame",
 }
 
-EMPTY_INPUT_HINT = (
-    "Type what you want, attach an image or clip, or both — then send."
-)
+EMPTY_INPUT_HINT = "Type what you want, attach an image or clip, or both — then send."
 
-# The four modes share one format and differ only in their header, the
-# alignment line, how the timeline relates to the reference frames, and the
-# worked example. Assembling them from shared parts keeps the common rules
-# from drifting apart between modes. Format follows MiniMax's official
-# guide (MiniMax-AI/MiniMax-H3, skills/h3-prompt-writing/references/base-en.txt).
+H3_MIN_SECONDS, H3_MAX_SECONDS = 4.0, 15.0
+
+_ENDING_WORDS = re.compile(r"\b(?:ends? on|ending on|finish(?:es)? on|final frame|last frame)\b")
+_OPENING_WORDS = re.compile(r"\b(?:starts? from|starting from|first frame|opening frame)\b")
+_BOTH_WORDS = re.compile(r"\b(?:first and last|between these|morph(?:s|ed|ing)?|transition from)\b")
+# A length the user typed ("[6s]", "10 seconds", "5-second") takes priority over the attached clip's.
+_STATED_DURATION = re.compile(
+    r"\[\s*\d+(?:\.\d+)?\s*s\s*\]|\b\d+(?:\.\d+)?\s*-?\s*(?:secs?|seconds?)\b", re.IGNORECASE
+)
+_THE_IMAGE = re.compile(r"\b(the) image('s)?\b", re.IGNORECASE)
+
+# Built from shared parts; format follows MiniMax-AI/MiniMax-H3 skills/h3-prompt-writing/references/base-en.txt.
 _INPUT_RULES = """INPUT
 The input may contain a MY INTENT section, SCENE DETAILS observed from a reference, or both. MY INTENT decides what the video depicts; the scene details supply concrete specifics for the elements they describe. Merge them into one coherent result and never contradict MY INTENT.
 
@@ -243,16 +240,16 @@ VISION_INSTRUCTION_VIDEO = {
 
 
 def choose_mode(text: str, images: List[str], video: Optional[str]) -> Tuple[str, str]:
-    """Explicit wins, otherwise infer from what was supplied."""
+    """Picks the H3 mode: an explicit mention wins, otherwise it follows what was attached."""
     low = (text or "").lower()
 
     for mode in ("fl2va", "i2va", "l2va", "t2va"):
         if re.search(rf"\b{mode}\b", low):
             return mode, f"you named {mode.upper()} in the message"
 
-    wants_end = any(p in low for p in ("end on", "ends on", "ending on", "final frame", "last frame", "finish on"))
-    wants_start = any(p in low for p in ("start from", "starts from", "starting from", "first frame", "opening frame"))
-    wants_both = any(p in low for p in ("first and last", "between these", "morph", "transition from"))
+    wants_end = bool(_ENDING_WORDS.search(low))
+    wants_start = bool(_OPENING_WORDS.search(low))
+    wants_both = bool(_BOTH_WORDS.search(low))
 
     if len(images) >= 2:
         return "fl2va", MODE_REASON["fl2va"]
@@ -270,15 +267,23 @@ def choose_mode(text: str, images: List[str], video: Optional[str]) -> Tuple[str
         return "t2va", "a clip used purely as reference material, so the prompt describes it standalone"
     return "t2va", MODE_REASON["t2va"]
 
-# Appended to every vision instruction. The caption is the real source of
-# "the image shows…" leakage: whatever meta-commentary the vision model
-# writes gets echoed by the writer into a prompt that will be pasted
-# somewhere with no reference attached.
-SCENE_ONLY_SUFFIX = (
-    " Describe only what is present in the scene itself. Do not say that this is an image, "
-    "photo, picture, frame, video or clip; do not comment on resolution, sharpness or quality; "
-    "and do not state what you cannot tell. Write it as a description of a real scene."
-)
+
+def clip_target(text: str, clip_seconds: Optional[float]) -> Tuple[Optional[float], str]:
+    """Returns the target duration to send (None leaves it to the writer) and a note if it was clamped."""
+    if clip_seconds is None or _STATED_DURATION.search(text or ""):
+        return None, ""
+    target = min(max(clip_seconds, H3_MIN_SECONDS), H3_MAX_SECONDS)
+    if target == clip_seconds:
+        return target, ""
+    return target, (
+        f"The clip runs {clip_seconds:.1f}s, outside H3's {H3_MIN_SECONDS:g}-{H3_MAX_SECONDS:g}s range, "
+        f"so the prompt targets {target:.2f}s."
+    )
+
+
+def frame_not_image(prompt: str) -> str:
+    """Says "frame" rather than "image" so a video prompt doesn't read as describing the reference picture."""
+    return _THE_IMAGE.sub(lambda m: f"{m.group(1)} frame{m.group(2) or ''}", prompt)
 
 
 class Pipe:
@@ -288,20 +293,14 @@ class Pipe:
         TEXT_MODEL: str = os.getenv("PROMPTHUB_TEXT_MODEL", "dolphin3:8b")
         FFMPEG_BINARY: str = os.getenv("PROMPTHUB_FFMPEG_BINARY", "ffmpeg")
         FFPROBE_BINARY: str = os.getenv("PROMPTHUB_FFPROBE_BINARY", "ffprobe")
-        # 4 sampled frames + the final frame = 5 images, which is what fits.
-        # llava:13b's vision context is 4096 tokens and each image costs
-        # ~576, so 9 images (the 8 the original spec asked for, plus the last
-        # frame) hard-fails with exceed_context_size_error. Raising num_ctx
-        # does NOT lift that image budget — only sending fewer images does.
+        # llava:13b fails past ~5 images (~576 tokens each of a 4096 budget); the final frame is one of them.
         FRAME_COUNT: int = int(os.getenv("PROMPTHUB_FRAME_COUNT", "4"))
         MAX_VISION_IMAGES: int = int(os.getenv("PROMPTHUB_MAX_VISION_IMAGES", "5"))
-        # Does improve the vision model's reasoning over the frames it can
-        # see, even though it doesn't raise the image budget.
+        # Ollama clamps this to the model's own limit (4096 for llava:13b).
         VISION_NUM_CTX: int = int(os.getenv("PROMPTHUB_VISION_NUM_CTX", "8192"))
-        # The system prompt plus a long caption can outgrow Ollama's default
-        # context, which truncates silently instead of failing.
+        # Ollama silently truncates prompts that overflow its default context.
         TEXT_NUM_CTX: int = int(os.getenv("PROMPTHUB_TEXT_NUM_CTX", "8192"))
-        REQUEST_TIMEOUT_SECONDS: int = 300
+        REQUEST_TIMEOUT_SECONDS: int = int(os.getenv("PROMPTHUB_REQUEST_TIMEOUT_SECONDS", "300"))
         REFERENCE_FRAME_DIR: str = os.getenv(
             "PROMPTHUB_REFERENCE_FRAME_DIR", os.path.expanduser("~/PromptHub/output")
         )
@@ -311,114 +310,86 @@ class Pipe:
         self.name = "MiniMax H3"
         self.valves = self.Valves()
 
-    async def pipe(self, body: dict, __files__: Optional[list] = None) -> str:
+    async def pipe(self, body: dict, __files__: Optional[list] = None, __task__: Optional[str] = None) -> str:
+        # Title/tag/follow-up jobs are routed here too; "" makes Open WebUI fall back without an LLM run.
+        if __task__:
+            return ""
+        videos, image_paths, unresolved = await resolve_attachments(__files__)
+        # Open WebUI awaits pipes on its event loop, so the blocking work runs in a thread.
+        return await asyncio.to_thread(self._run, body, videos, image_paths, unresolved)
+
+    def _run(self, body: dict, videos: List[str], image_paths: List[str], unresolved: str) -> str:
         v = self.valves
         text = extract_user_text(body)
-        images = extract_images_b64(body)
-        video, file_images, unresolved = await resolve_attachments(__files__)
-        images = images + file_images
+        images, inline_problem = extract_images_b64(body)
+        problem = attachment_problem(
+            len(videos), len(images) + len(image_paths), "; ".join(p for p in (unresolved, inline_problem) if p)
+        )
+        if problem:
+            return problem
+        if not text and not images and not image_paths and not videos:
+            return "⚠️ " + EMPTY_INPUT_HINT
 
-        if not text and not images and not video:
-            return "\u26a0\ufe0f " + EMPTY_INPUT_HINT
-
-        # Never quietly ignore an attachment: writing a prompt from the text
-        # alone would look like it worked while silently dropping the file.
-        if unresolved and not video and not images:
-            return (
-                "\u26a0\ufe0f You attached a file, but it couldn't be read "
-                f"({unresolved}). Nothing was generated, because answering from "
-                "your text alone would have silently ignored the attachment.\n\n"
-                "If it's an unusual format, try re-encoding to mp4 — or describe "
-                "it in the message text instead, which needs no attachment at all."
-            )
-
-        mode, reason = choose_mode(text, images, video)
-        policy = REFERENCE_POLICY[mode]
-
+        video = videos[0] if videos else None
         workdir = tempfile.mkdtemp(prefix="prompthub_")
         try:
-            caption = ""
-            duration = None
-            refs: List[Tuple[str, str]] = []
-
-            if video:
-                duration = probe_duration(video, v.FFPROBE_BINARY)
-                frames = extract_frames(video, workdir, duration, v.FRAME_COUNT, v.FFMPEG_BINARY)
-
-                # Best-effort: only the keyframe modes actually need the
-                # final frame, so a failure here shouldn't sink a T2VA run.
-                last_frame = os.path.join(workdir, "frame_last.jpg")
-                try:
-                    extract_last_frame(video, last_frame, v.FFMPEG_BINARY)
-                except subprocess.CalledProcessError:
-                    if policy in ("last", "first_last"):
-                        raise
-                    last_frame = None
-
-                frames_b64 = [file_to_b64(p) for p in frames]
-                if last_frame:
-                    frames_b64.append(file_to_b64(last_frame))
-
-                caption = ollama_vision(
-                    v.OLLAMA_BASE_URL,
-                    v.VISION_MODEL,
-                    VISION_INSTRUCTION_VIDEO[mode] + SCENE_ONLY_SUFFIX,
-                    cap_images(frames_b64, v.MAX_VISION_IMAGES),
-                    v.REQUEST_TIMEOUT_SECONDS,
-                    v.VISION_NUM_CTX,
-                )
-                refs = save_video_references(
-                    frames[0], last_frame or frames[-1], policy, v.REFERENCE_FRAME_DIR
-                )
-            elif images:
-                caption = ollama_vision(
-                    v.OLLAMA_BASE_URL,
-                    v.VISION_MODEL,
-                    VISION_INSTRUCTION_IMAGE[mode] + SCENE_ONLY_SUFFIX,
-                    cap_images(images, v.MAX_VISION_IMAGES),
-                    v.REQUEST_TIMEOUT_SECONDS,
-                    v.VISION_NUM_CTX,
-                )
-                refs = save_image_references(images, policy, v.REFERENCE_FRAME_DIR)
-
-            idea = build_idea(text, clean_caption(caption), duration)
-            final_prompt = tidy_output(ollama_generate(
+            images += [file_to_b64(p) for p in image_paths]
+            mode, reason = choose_mode(text, images, video)
+            policy = REFERENCE_POLICY[mode]
+            caption, clip_seconds, first_frame, last_frame = caption_attachments(
+                v, video, images, VISION_INSTRUCTION_VIDEO[mode], VISION_INSTRUCTION_IMAGE[mode], workdir,
+                need_last_frame=policy in ("last", "first_last"),
+            )
+            duration, duration_note = clip_target(text, clip_seconds)
+            idea = build_idea(text, caption, duration)
+            final_prompt = frame_not_image(tidy_output(ollama_generate(
                 v.OLLAMA_BASE_URL, v.TEXT_MODEL, SYSTEM_PROMPTS[mode], idea, v.REQUEST_TIMEOUT_SECONDS,
-                v.TEXT_NUM_CTX)
-            )
-        except (
-            requests.RequestException,
-            subprocess.CalledProcessError,
-            RuntimeError,
-            ValueError,
-        ) as exc:
-            return (
-                f"\u26a0\ufe0f Could not build the prompt: {exc}\n\nManual fallback: describe the "
-                "image/video yourself in the message text instead — the typed path needs no "
-                "vision model or ffmpeg."
-            )
+                v.TEXT_NUM_CTX,
+            )))
+            if video:
+                refs = save_video_references(first_frame, last_frame or first_frame, policy, v.REFERENCE_FRAME_DIR)
+            else:
+                refs = save_image_references(images, policy, v.REFERENCE_FRAME_DIR)
+        except PIPELINE_ERRORS as exc:
+            return pipeline_error(exc, bool(video or images))
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
 
         others = " / ".join(m.upper() for m in ("t2va", "i2va", "fl2va", "l2va") if m != mode)
-        note = (
-            f"\n\n---\nWrote a **{mode.upper()}** prompt \u2014 {reason}.\n"
-            f"To force a different one, just say so in the message ({others})."
-        )
+        note = f"\n\n---\nWrote a **{mode.upper()}** prompt — {reason}.\n"
+        if duration_note:
+            note += duration_note + "\n"
+        note += f"To force a different one, just say so in the message ({others})."
         return final_prompt + reference_footer(refs, policy) + note
 
 
-# --- helpers --------------------------------------------------------
-# Duplicated (not imported) across the function files on purpose: Open WebUI
-# stores each Function's code independently and can't import siblings, so
-# each file has to stand alone. Keep this block in sync across all five.
+# --- shared helpers: keep identical across models/*.py (Functions can't import each other) ---
+
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v", ".mpg", ".mpeg"}
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+ATTACHMENT_TYPES = {None, "file", "image", "video"}
+
+PIPELINE_ERRORS = (
+    requests.RequestException,
+    subprocess.CalledProcessError,
+    OSError,
+    RuntimeError,
+    ValueError,
+    KeyError,
+)
+
+# The vision caption is where "the image shows…" leaks into prompts, so it's told to describe the scene.
+SCENE_ONLY_SUFFIX = (
+    " Describe only what is present in the scene itself. Do not say that this is an image, "
+    "photo, picture, frame, video or clip; do not comment on resolution, sharpness or quality; "
+    "and do not state what you cannot tell. Write it as a description of a real scene."
+)
 
 
 def extract_user_text(body: dict) -> str:
-    messages = body.get("messages", [])
-    if not messages:
-        return ""
-    content = messages[-1].get("content")
+    """Returns the text of the last message."""
+    messages = body.get("messages") or []
+    content = messages[-1].get("content") if messages else None
     if isinstance(content, str):
         return content.strip()
     if isinstance(content, list):
@@ -427,110 +398,150 @@ def extract_user_text(body: dict) -> str:
     return ""
 
 
-def extract_images_b64(body: dict) -> List[str]:
-    """Open WebUI embeds uploaded images inline in the last user message as
-    OpenAI-style content blocks — they never arrive via __files__."""
-    messages = body.get("messages", [])
-    if not messages:
-        return []
-    content = messages[-1].get("content")
+def extract_images_b64(body: dict) -> Tuple[List[str], str]:
+    """Returns base64 images inlined in the last message, plus a note on any that aren't image data."""
+    messages = body.get("messages") or []
+    content = messages[-1].get("content") if messages else None
     if not isinstance(content, list):
-        return []
+        return [], ""
 
-    out = []
+    images, unusable = [], 0
     for block in content:
         if not isinstance(block, dict) or block.get("type") != "image_url":
             continue
-        url = block.get("image_url", {}).get("url", "")
-        if url.startswith("data:"):
-            out.append(url.split(",", 1)[1])
-        elif url:
-            resp = requests.get(url, timeout=30)
-            resp.raise_for_status()
-            out.append(base64.b64encode(resp.content).decode())
-    return out
+        image_url = block.get("image_url")
+        url = image_url.get("url", "") if isinstance(image_url, dict) else str(image_url or "")
+        header, _, data = url.partition(",")
+        if header.startswith("data:") and header.endswith(";base64") and data:
+            images.append(data)
+        else:
+            unusable += 1
+    return images, (f"{unusable} inline image(s) arrived as a link rather than image data" if unusable else "")
 
 
-async def resolve_attachments(files: Optional[list]) -> Tuple[Optional[str], List[str], str]:
-    """Turns __files__ into (video_path, image_b64_list, unresolved_reason).
-
-    __files__ entries are not a fixed shape: the browser sends a fat record,
-    the REST API may send as little as {"type": "file", "id": "..."} with no
-    path at all. So resolve the id through Open WebUI's own Files model —
-    we're in-process, so that's available — and fall back to the uploads
-    directory layout. Note Files.get_file_by_id is a coroutine in current
-    versions; un-awaited it yields an object with no usable attributes,
-    which silently looks like "no file attached".
-    """
-    if not files:
-        return None, [], ""
-
-    video_path = None
-    image_b64: List[str] = []
+async def resolve_attachments(files: Optional[list]) -> Tuple[List[str], List[str], str]:
+    """Turns __files__ into (video_paths, image_paths, unresolved_reason)."""
+    videos: List[str] = []
+    images: List[str] = []
     problems = []
 
-    for f in files:
-        if not isinstance(f, dict):
+    for f in files or []:
+        if not isinstance(f, dict) or f.get("type") not in ATTACHMENT_TYPES:
             continue
-        inner = f.get("file") if isinstance(f.get("file"), dict) else f
-        file_id = f.get("id") or inner.get("id")
-        path = inner.get("path")
+        inner = f["file"] if isinstance(f.get("file"), dict) else f
         meta = inner.get("meta") if isinstance(inner.get("meta"), dict) else {}
-        content_type = (meta or {}).get("content_type") or ""
+        file_id = f.get("id") or inner.get("id")
+        name = inner.get("filename") or meta.get("name") or file_id or "attachment"
 
-        if not path and file_id:
-            path, resolved_type = await _resolve_file_by_id(file_id)
-            content_type = content_type or resolved_type
+        path, content_type = await _resolve_file_by_id(file_id) if file_id else (None, "")
+        content_type = content_type or meta.get("content_type") or ""
+        # The payload path is client-supplied, so it's only trusted inside the uploads directory.
+        if not path and _inside_uploads(inner.get("path")):
+            path = inner.get("path")
 
-        name = inner.get("filename") or (meta or {}).get("name") or file_id or "attachment"
+        ext = os.path.splitext(path or "")[1].lower()
         if not path:
             problems.append(f"{name}: could not locate it on disk")
-            continue
-        if not os.path.exists(path):
+        elif not os.path.exists(path):
             problems.append(f"{name}: stored path no longer exists")
-            continue
-
-        if content_type.startswith("image/"):
-            image_b64.append(file_to_b64(path))
-        elif content_type.startswith("video/") or os.path.splitext(path)[1].lower() in VIDEO_EXTENSIONS:
-            video_path = video_path or path
+        elif content_type.startswith("image/") or (not content_type and ext in IMAGE_EXTENSIONS):
+            images.append(path)
+        elif content_type.startswith("video/") or ext in VIDEO_EXTENSIONS:
+            videos.append(path)
         else:
             problems.append(f"{name}: unsupported type ({content_type or 'unknown'})")
 
-    return video_path, image_b64, "; ".join(problems)
+    return videos, images, "; ".join(problems)
 
 
 async def _resolve_file_by_id(file_id: str) -> Tuple[Optional[str], str]:
+    """Looks up an upload's path and content type via Open WebUI, falling back to the uploads layout."""
     try:
         from open_webui.models.files import Files
 
         record = Files.get_file_by_id(file_id)
+        # A coroutine in current Open WebUI; un-awaited it silently looks like "no file".
         if inspect.isawaitable(record):
             record = await record
         if record is not None:
-            meta = getattr(record, "meta", None) or {}
-            content_type = meta.get("content_type") or "" if isinstance(meta, dict) else ""
+            meta = getattr(record, "meta", None)
+            content_type = (meta.get("content_type") or "") if isinstance(meta, dict) else ""
             return getattr(record, "path", None), content_type
     except Exception:
         pass
 
-    # Layout fallback: <UPLOAD_DIR>/<file id>_<original filename>
+    if not re.fullmatch(r"[\w-]+", file_id):
+        return None, ""
     try:
         from open_webui.config import UPLOAD_DIR
 
-        hits = glob.glob(os.path.join(str(UPLOAD_DIR), f"{file_id}_*"))
+        hits = glob.glob(os.path.join(glob.escape(str(UPLOAD_DIR)), f"{file_id}_*"))
         if hits:
             return hits[0], ""
     except Exception:
         pass
-
     return None, ""
 
 
+def _inside_uploads(path: Optional[str]) -> bool:
+    """Checks that a path points inside Open WebUI's uploads directory."""
+    if not path:
+        return False
+    try:
+        from open_webui.config import UPLOAD_DIR
+    except Exception:
+        return False
+    root = os.path.realpath(str(UPLOAD_DIR))
+    return os.path.realpath(path).startswith(root + os.sep)
+
+
+def attachment_problem(video_count: int, image_count: int, unresolved: str) -> str:
+    """Returns a warning when the attachments can't be used as sent, else an empty string."""
+    if unresolved:
+        return (
+            f"⚠️ An attachment couldn't be read ({unresolved}). Nothing was generated, "
+            "because answering without it would silently ignore it.\n\n"
+            "Re-encode it (mp4 for clips, png or jpg for images), or describe it in the message text instead."
+        )
+    if video_count > 1 or (video_count and image_count):
+        return (
+            "⚠️ Attach either one clip or images, not both (or several clips) in the same "
+            "message: only one source is described per prompt."
+        )
+    return ""
+
+
+def caption_attachments(
+    v, video: Optional[str], images: List[str], video_instruction: str, image_instruction: str,
+    workdir: str, need_last_frame: bool = False,
+) -> Tuple[str, Optional[float], Optional[str], Optional[str]]:
+    """Describes the clip or images; returns (caption, clip_seconds, first_frame, last_frame)."""
+    if video:
+        seconds = probe_duration(video, v.FFPROBE_BINARY)
+        frames = extract_frames(video, workdir, seconds, v.FRAME_COUNT, v.FFMPEG_BINARY)
+        last = extract_last_frame(video, os.path.join(workdir, "frame_last.jpg"), seconds, v.FFMPEG_BINARY)
+        if need_last_frame and not last:
+            raise RuntimeError("ffmpeg could not extract the clip's final frame")
+        encoded = [file_to_b64(p) for p in frames + ([last] if last else [])]
+        instruction, first = video_instruction, frames[0]
+    elif images:
+        seconds, first, last, encoded, instruction = None, None, None, images, image_instruction
+    else:
+        return "", None, None, None
+
+    caption = ollama_vision(
+        v.OLLAMA_BASE_URL,
+        v.VISION_MODEL,
+        instruction + SCENE_ONLY_SUFFIX,
+        cap_images(encoded, v.MAX_VISION_IMAGES),
+        v.REQUEST_TIMEOUT_SECONDS,
+        v.VISION_NUM_CTX,
+    )
+    return clean_caption(caption), seconds, first, last
+
+
 def build_idea(text: str, caption: str, duration: Optional[float]) -> str:
-    """Frames the vision caption as facts about the scene rather than as
-    "an attached image", so the written prompt doesn't inherit references
-    to something the downstream generator can't see."""
+    """Frames the caption as facts about the scene, so the prompt never points back at a reference."""
     parts = []
     if duration is not None:
         parts.append(f"Target duration: {duration:.2f} seconds.")
@@ -550,78 +561,102 @@ def build_idea(text: str, caption: str, duration: Optional[float]) -> str:
     return "\n\n".join(parts)
 
 
+def run_tool(cmd: List[str], text: bool = False) -> subprocess.CompletedProcess:
+    """Runs ffmpeg/ffprobe, turning a missing binary into a readable error."""
+    try:
+        return subprocess.run(cmd, check=True, capture_output=True, text=text)
+    except FileNotFoundError:
+        raise RuntimeError(
+            f"{cmd[0]} was not found; install ffmpeg or set the FFMPEG_BINARY / FFPROBE_BINARY valves"
+        ) from None
+
+
+def stderr_tail(exc: subprocess.CalledProcessError) -> str:
+    """Returns the last non-empty stderr line of a failed tool run."""
+    err = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+    lines = [line.strip() for line in err.splitlines() if line.strip()]
+    return lines[-1] if lines else ""
+
+
 def probe_duration(video_path: str, ffprobe_bin: str) -> float:
-    result = subprocess.run(
-        [ffprobe_bin, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", video_path],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    duration = float(result.stdout.strip())
-    if duration <= 0:
-        raise RuntimeError("could not determine video duration")
-    return duration
+    """Returns the video stream's length, falling back to the container and then the last packet."""
+    # The container can outlast the video (longer audio) or report N/A (streamed webm).
+    for entries in (
+        ["-select_streams", "v:0", "-show_entries", "stream=duration"],
+        ["-show_entries", "format=duration"],
+        ["-select_streams", "v:0", "-show_entries", "packet=pts_time"],
+    ):
+        out = run_tool([ffprobe_bin, "-v", "error", *entries, "-of", "csv=p=0", video_path], text=True).stdout
+        values = [float(x) for x in re.findall(r"\d+(?:\.\d+)?", out)]
+        if values and max(values) > 0:
+            return max(values)
+    raise RuntimeError("could not determine the clip's duration")
 
 
 def extract_frame_at(video_path: str, out_path: str, timestamp: float, ffmpeg_bin: str) -> None:
-    subprocess.run(
-        [ffmpeg_bin, "-y", "-ss", f"{max(timestamp, 0):.3f}", "-i", video_path, "-frames:v", "1", "-q:v", "2", out_path],
-        check=True,
-        capture_output=True,
-    )
+    run_tool([ffmpeg_bin, "-y", "-ss", f"{max(timestamp, 0):.3f}", "-i", video_path,
+              "-frames:v", "1", "-q:v", "2", out_path])
 
 
 def extract_frames(video_path: str, out_dir: str, duration: float, frame_count: int, ffmpeg_bin: str) -> List[str]:
-    paths = []
-    for i in range(frame_count):
+    """Samples frames evenly across the clip, skipping any timestamp ffmpeg can't decode."""
+    count = max(1, frame_count)
+    paths, last_error = [], ""
+    for i in range(count):
         out_path = os.path.join(out_dir, f"frame_{i:02d}.jpg")
-        extract_frame_at(video_path, out_path, duration * i / frame_count, ffmpeg_bin)
-        paths.append(out_path)
+        try:
+            extract_frame_at(video_path, out_path, duration * i / count, ffmpeg_bin)
+        except subprocess.CalledProcessError as exc:
+            last_error = stderr_tail(exc)
+            continue
+        if os.path.exists(out_path):
+            paths.append(out_path)
+    if not paths:
+        raise RuntimeError("ffmpeg could not extract any frames from the clip" + (f": {last_error}" if last_error else ""))
     return paths
 
 
-def extract_last_frame(video_path: str, out_path: str, ffmpeg_bin: str) -> None:
-    """Grabs the true final frame.
-
-    Seeking to `duration - epsilon` is unreliable: on a short or low-fps clip
-    that timestamp can land past the last frame and ffmpeg exits non-zero
-    with no output (a 3.00s @ 15fps clip has its last frame at 2.933s, so
-    even -0.05 overshoots). Seeking relative to the end and letting
-    `-update 1` overwrite each decoded frame leaves the final one in place,
-    and clamps harmlessly to the start on clips shorter than the window.
-    """
-    subprocess.run(
-        [ffmpeg_bin, "-y", "-sseof", "-3", "-i", video_path, "-update", "1", "-q:v", "2", out_path],
-        check=True,
-        capture_output=True,
-    )
+def extract_last_frame(video_path: str, out_path: str, duration: float, ffmpeg_bin: str) -> Optional[str]:
+    """Writes the clip's true final frame to out_path, or returns None if ffmpeg can't."""
+    # Seeking to duration-epsilon overshoots on short/low-fps clips; decoding the tail with -update 1 keeps the last frame.
+    try:
+        run_tool([ffmpeg_bin, "-y", "-ss", f"{max(duration - 3, 0):.3f}", "-i", video_path,
+                  "-update", "1", "-q:v", "2", out_path])
+    except subprocess.CalledProcessError:
+        return None
+    return out_path if os.path.exists(out_path) else None
 
 
-def save_video_references(first_path: str, last_path: str, policy: str, ref_dir: str):
-    if policy == "none":
-        return []
-    if policy == "first":
-        return [("Reference frame (Picture 1, t=0)", _copy_ref(first_path, ref_dir, "picture1"))]
-    if policy == "last":
-        return [("Reference frame (Picture 1, final frame)", _copy_ref(last_path, ref_dir, "picture1"))]
-    return [
-        ("Reference frame (Picture 1, t=0)", _copy_ref(first_path, ref_dir, "picture1")),
-        ("Reference frame (Picture 2, final frame)", _copy_ref(last_path, ref_dir, "picture2")),
-    ]
+def save_video_references(first_path: str, last_path: str, policy: str, ref_dir: str) -> List[Tuple[str, str]]:
+    """Copies the frames the mode needs into ref_dir; returns (label, path) pairs."""
+    stamp = _ref_stamp()
+    wanted = {
+        "none": [],
+        "first": [("Reference frame (Picture 1, t=0)", first_path, "picture1")],
+        "last": [("Reference frame (Picture 1, final frame)", last_path, "picture1")],
+        "first_last": [
+            ("Reference frame (Picture 1, t=0)", first_path, "picture1"),
+            ("Reference frame (Picture 2, final frame)", last_path, "picture2"),
+        ],
+    }[policy]
+    return [(label, _copy_ref(src, ref_dir, f"{name}_{stamp}")) for label, src, name in wanted]
 
 
-def save_image_references(images_b64: List[str], policy: str, ref_dir: str):
+def save_image_references(images_b64: List[str], policy: str, ref_dir: str) -> List[Tuple[str, str]]:
+    """Writes the reference images the mode needs into ref_dir; returns (label, path) pairs."""
     if policy == "none" or not images_b64:
         return []
+    stamp = _ref_stamp()
     if policy in ("first", "last"):
-        return [("Reference image (Picture 1)", _write_ref(images_b64[0], ref_dir, "picture1"))]
-    refs = [("Reference image (Picture 1, opening)", _write_ref(images_b64[0], ref_dir, "picture1"))]
+        return [("Reference image (Picture 1)", _write_ref(images_b64[0], ref_dir, f"picture1_{stamp}"))]
+    refs = [("Reference image (Picture 1, opening)", _write_ref(images_b64[0], ref_dir, f"picture1_{stamp}"))]
     if len(images_b64) > 1:
-        refs.append(("Reference image (Picture 2, ending)", _write_ref(images_b64[1], ref_dir, "picture2")))
+        refs.append(("Reference image (Picture 2, ending)", _write_ref(images_b64[-1], ref_dir, f"picture2_{stamp}")))
     return refs
 
 
-def reference_footer(refs, policy: str) -> str:
+def reference_footer(refs: List[Tuple[str, str]], policy: str) -> str:
+    """Lists the saved reference files, or says which ones the user has to supply."""
     if policy == "none":
         return ""
     if not refs:
@@ -631,26 +666,45 @@ def reference_footer(refs, policy: str) -> str:
             "first_last": "an opening- and an ending-frame",
         }[policy]
         return (
-            "\n\n\u2139\ufe0f No reference image was saved (nothing was attached), so supply "
+            "\n\nℹ️ No reference image was saved (nothing was attached), so supply "
             f"{needed} image to the generator yourself."
         )
     listed = "\n".join(f"{label} saved to: {path}" for label, path in refs)
+    if policy == "first_last" and len(refs) < 2:
+        listed += "\nℹ️ Only one image was attached, so supply the ending frame (Picture 2) yourself."
     return "\n\n" + listed + "\nSupply these to your MiniMax generation alongside the prompt above."
 
 
-def _copy_ref(frame_path: str, ref_dir: str, label: str) -> str:
+def _ref_stamp() -> str:
+    """Returns a sortable, collision-free suffix shared by one request's reference files."""
+    return f"{int(time.time())}_{uuid.uuid4().hex[:6]}"
+
+
+def _copy_ref(frame_path: str, ref_dir: str, name: str) -> str:
     os.makedirs(ref_dir, exist_ok=True)
-    dest = os.path.join(ref_dir, f"{label}_{int(time.time())}.jpg")
+    dest = os.path.join(ref_dir, f"{name}.jpg")
     shutil.copyfile(frame_path, dest)
     return dest
 
 
-def _write_ref(image_b64: str, ref_dir: str, label: str) -> str:
+def _write_ref(image_b64: str, ref_dir: str, name: str) -> str:
+    data = base64.b64decode(image_b64)
     os.makedirs(ref_dir, exist_ok=True)
-    dest = os.path.join(ref_dir, f"{label}_{int(time.time())}.jpg")
+    dest = os.path.join(ref_dir, name + _image_ext(data))
     with open(dest, "wb") as fh:
-        fh.write(base64.b64decode(image_b64))
+        fh.write(data)
     return dest
+
+
+def _image_ext(data: bytes) -> str:
+    """Picks a file extension from the image's magic bytes."""
+    if data.startswith(b"\x89PNG"):
+        return ".png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    if data.startswith(b"GIF8"):
+        return ".gif"
+    return ".jpg"
 
 
 def file_to_b64(path: str) -> str:
@@ -659,13 +713,7 @@ def file_to_b64(path: str) -> str:
 
 
 def cap_images(images: List[str], limit: int) -> List[str]:
-    """Keeps the image count inside the vision model's budget.
-
-    llava:13b allows ~4096 vision tokens at ~576 per image, so more than
-    about five images fails outright with exceed_context_size_error. Rather
-    than surface that as an error, subsample evenly and keep the endpoints,
-    which are the frames that matter most for first/last references.
-    """
+    """Subsamples evenly down to the vision model's image budget, keeping both endpoints."""
     if limit <= 0 or len(images) <= limit:
         return images
     if limit == 1:
@@ -683,27 +731,53 @@ def ollama_vision(
     base_url: str, model: str, instruction: str, images_b64: List[str], timeout: int, num_ctx: int = 0
 ) -> str:
     payload = {"model": model, "prompt": instruction, "images": images_b64, "stream": False}
-    if num_ctx:
-        payload["options"] = {"num_ctx": num_ctx}
-    resp = requests.post(f"{base_url}/api/generate", json=payload, timeout=timeout)
-    resp.raise_for_status()
-    return resp.json()["response"].strip()
+    return _ollama_generate(base_url, payload, timeout, num_ctx)
 
 
 def ollama_generate(
     base_url: str, model: str, system: str, prompt: str, timeout: int, num_ctx: int = 0
 ) -> str:
     payload = {"model": model, "system": system, "prompt": prompt, "stream": False}
+    return _ollama_generate(base_url, payload, timeout, num_ctx)
+
+
+def _ollama_generate(base_url: str, payload: dict, timeout: int, num_ctx: int) -> str:
+    """Posts to Ollama's generate endpoint, surfacing Ollama's own error text on failure."""
     if num_ctx:
         payload["options"] = {"num_ctx": num_ctx}
-    resp = requests.post(f"{base_url}/api/generate", json=payload, timeout=timeout)
-    resp.raise_for_status()
-    return resp.json()["response"].strip()
+    resp = requests.post(f"{base_url.rstrip('/')}/api/generate", json=payload, timeout=timeout)
+    if not resp.ok:
+        try:
+            detail = resp.json().get("error") or resp.text
+        except ValueError:
+            detail = resp.text
+        raise RuntimeError(f"Ollama returned {resp.status_code} for {payload['model']}: {detail.strip()[:300]}")
+    text = (resp.json().get("response") or "").strip()
+    if not text:
+        raise RuntimeError(f"{payload['model']} returned an empty response")
+    return text
 
 
-# Sentences that are about the medium rather than the scene. The vision
-# model emits these regularly and an 8B writer happily echoes them, so they
-# are removed deterministically instead of being forbidden by instruction.
+def pipeline_error(exc: Exception, had_attachment: bool) -> str:
+    """Formats a pipeline failure as a user-facing message."""
+    if isinstance(exc, requests.ConnectionError):
+        detail = "could not reach Ollama. Is it running?"
+    elif isinstance(exc, requests.Timeout):
+        detail = "Ollama timed out. The model may still be loading: retry, or raise REQUEST_TIMEOUT_SECONDS"
+    elif isinstance(exc, subprocess.CalledProcessError):
+        detail = f"{os.path.basename(str(exc.cmd[0]))} failed: {stderr_tail(exc) or f'exit status {exc.returncode}'}"
+    else:
+        detail = str(exc) or type(exc).__name__
+    message = f"⚠️ Could not build the prompt: {detail}"
+    if had_attachment:
+        message += (
+            "\n\nFallback: describe the attachment in the message text instead. The typed path "
+            "needs no vision model or ffmpeg."
+        )
+    return message
+
+
+# Vision models emit medium-talk regularly and an 8B writer echoes it, so it's removed deterministically.
 _META_SENTENCE = re.compile(
     r"\b(resolution|low[- ]quality|blurry|pixelated|two[- ]dimensional|flat image|"
     r"no discernible|cannot (?:be )?determine|difficult to (?:describe|discern|tell)|"
@@ -711,18 +785,20 @@ _META_SENTENCE = re.compile(
     re.IGNORECASE,
 )
 
+_MEDIUM = r"(?:image|photo|picture|frame|video|clip|scene)"
+_PROVIDED = r"(?:\s+you(?:'ve|\s+have)?\s+provided)?"
+# Lead-ins need a verb or "In the …," so noun phrases like "The frame of the bike" survive.
 _META_LEADIN = re.compile(
-    r"^\s*(?:in\s+)?(?:the|this)\s+(?:image|photo|picture|frame|video|clip|scene)\s*"
-    r"(?:you(?:'ve|\s+have)?\s+provided\s*)?,?\s*"
-    r"(?:appears\s+to\s+|seems\s+to\s+)?"
-    r"(?:is\s+|shows|depicts|features|contains|presents|captures|displays)?\s*",
+    rf"^\s*(?:in\s+(?:the|this)\s+{_MEDIUM}{_PROVIDED}\s*,?\s*"
+    rf"|(?:the|this)\s+{_MEDIUM}{_PROVIDED}\s+(?:appears\s+to\s+|seems\s+to\s+)?"
+    rf"(?:shows?|depicts?|features?|contains?|presents?|captures?|displays?|is\s+of)\s+"
+    rf"|(?:the|this)\s+(?:image|photo|picture|video){_PROVIDED}\s+(?:appears\s+to\s+be|seems\s+to\s+be|is)\s+)",
     re.IGNORECASE,
 )
 
 
 def clean_caption(caption: str) -> str:
-    """Strips medium-talk out of the vision caption before it reaches the
-    writer, so the finished prompt describes a scene rather than a file."""
+    """Strips medium-talk from the vision caption so the prompt describes a scene, not a file."""
     kept = []
     for raw in re.split(r"(?<=[.!?])\s+", caption or ""):
         sentence = raw.strip()
@@ -735,17 +811,10 @@ def clean_caption(caption: str) -> str:
 
 
 def tidy_output(text: str) -> str:
-    """Removes wrappers the writer occasionally adds around the prompt."""
+    """Strips code fences and a stray "Alignment Instruction:" label the writer sometimes adds."""
     out = (text or "").strip()
     if out.startswith("```"):
         out = re.sub(r"^```[a-zA-Z]*\n?", "", out)
         out = re.sub(r"\n?```$", "", out).strip()
-    # e.g. 'Alignment Instruction: For the target video, at 0.00 seconds…'
     out = re.sub(r"^\s*alignment instruction\s*:\s*", "", out, count=1, flags=re.IGNORECASE)
-
-    # This is a video prompt, so "the image" reads wrong and blurs into the
-    # reference picture. MiniMax's own <Picture N> tokens are untouched, and
-    # the reference-path footer is appended after this runs.
-    out = re.sub(r"\bthe image's\b", "the frame's", out, flags=re.IGNORECASE)
-    out = re.sub(r"\bthe image\b", "the frame", out, flags=re.IGNORECASE)
     return out.strip()

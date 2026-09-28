@@ -1,22 +1,5 @@
 #!/usr/bin/env python3
-"""Seeds a running Open WebUI instance via its REST API: creates the admin
-account on first run, deploys the two Pipe Functions from this repo,
-removes entries from earlier layouts, disables the Ollama connection so raw
-models stay out of the picker, and sorts the picker alphabetically.
-No manual UI steps needed.
-
-The picker ends up holding exactly PromptHub's two entries, all of the same
-type, because every one of them is a Pipe Function that calls Ollama
-directly over HTTP rather than resolving through an Open WebUI model
-connection. That's what makes disabling the connection safe — see
-disable_ollama_connection() for the verification behind that claim.
-
-Safe to re-run — everything is created-or-updated, so re-running after
-editing a function file syncs the change into Open WebUI.
-
-Uses only the Python standard library so it has no dependency on anything
-pip-installed into Open WebUI's own venv.
-"""
+"""Seeds a running Open WebUI through its REST API; safe to re-run after editing a Function."""
 
 import json
 import os
@@ -33,29 +16,15 @@ CREDS_FILE = HOME_DIR / ".admin_credentials.json"
 TEXT_MODEL = os.environ.get("PROMPTHUB_TEXT_MODEL", "dolphin3:8b")
 VISION_MODEL = os.environ.get("PROMPTHUB_VISION_MODEL", "llava:13b")
 
-# One Function per target model. Each accepts a typed message, an
-# attachment (image or video), or both together.
-#
-# MiniMax H3 is a single entry even though H3 has four modes
-# (T2VA/I2VA/FL2VA/L2VA): which mode applies is a consequence of what you
-# supplied — no attachment, one reference image, two, or an ending frame —
-# not a preference, so the Function infers it and says which it used. Making
-# the user choose meant understanding H3's reference-frame semantics before
-# writing a single prompt.
-#
-# They're Pipe Functions rather than Open WebUI "Model presets" because a
-# preset only works while its base model is exposed in the picker, which
-# forced dolphin3:8b/llava:13b to sit there next to PromptHub's own entries.
-# Functions call Ollama directly over HTTP, so nothing depends on the
-# connection being listed and it can be switched off entirely (see
-# disable_ollama_connection below).
+# Pipe Functions, not Model presets: a preset breaks once the Ollama connection is disabled.
 FUNCTIONS = [
     ("krea2", "Krea2", REPO_ROOT / "models" / "krea2.py"),
     ("minimax_h3", "MiniMax H3", REPO_ROOT / "models" / "minimax_h3.py"),
 ]
 
-# Model presets from before v0.4, deleted on sight so they don't linger in
-# the picker as broken entries once the connection is disabled.
+SHARED_HELPERS_MARKER = "# --- shared helpers"
+
+# Pre-v0.4 Model presets, deleted so they don't linger as broken picker entries.
 OBSOLETE_PRESETS = [
     "krea2-prompt-writer",
     "minimax-t2va-prompt-writer",
@@ -64,8 +33,7 @@ OBSOLETE_PRESETS = [
     "minimax-l2va-prompt-writer",
 ]
 
-# Functions from earlier layouts: v0.4 split every mode by input type, and
-# v0.5 still had one entry per MiniMax mode.
+# Functions from the v0.4 (split by input type) and v0.5 (one per MiniMax mode) layouts.
 OBSOLETE_FUNCTIONS = [
     "krea2_from_text",
     "krea2_from_image",
@@ -137,7 +105,7 @@ def get_token() -> str:
         _save_creds(email, password)
         print(f"Created Open WebUI admin account: {email}")
         print(f"Credentials saved to {CREDS_FILE} (used to seed on future runs too).")
-        print("Use the same email/password to log in at http://localhost:8080 in your browser.")
+        print(f"Use the same email/password to log in at {BASE_URL} in your browser.")
         return body["token"]
 
     print(f"Signup failed (status {status}): {body}")
@@ -150,12 +118,23 @@ def get_token() -> str:
 
 
 def _save_creds(email: str, password: str) -> None:
-    CREDS_FILE.write_text(json.dumps({"email": email, "password": password}))
+    """Writes the credentials file owner-only from the moment it exists."""
+    fd = os.open(CREDS_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(json.dumps({"email": email, "password": password}))
     os.chmod(CREDS_FILE, 0o600)
 
 
-def seed_functions(token: str) -> bool:
-    created_any = False
+def check_shared_helpers() -> None:
+    """Warns when the helper block duplicated across the Function files has drifted."""
+    blocks = {path.name: path.read_text().partition(SHARED_HELPERS_MARKER)[2] for _, _, path in FUNCTIONS}
+    if len(set(blocks.values())) > 1:
+        print(f"  WARNING: the shared helper block differs between {', '.join(blocks)}; keep it identical")
+
+
+def seed_functions(token: str):
+    """Creates or updates each Function; returns (created_any, failed_ids)."""
+    created_any, failed = False, []
     for func_id, name, path in FUNCTIONS:
         payload = {
             "id": func_id,
@@ -176,11 +155,10 @@ def seed_functions(token: str) -> bool:
                 print(f"  updated function: {func_id}")
             else:
                 print(f"  FAILED to create/update function {func_id}: {status} {body}")
+                failed.append(func_id)
                 continue
 
-        # create/update silently ignore `is_active` in the payload — it has
-        # to be flipped explicitly via /toggle, or the function is created
-        # disabled and never shows up as a selectable model.
+        # create/update ignore `is_active`, so a new Function stays disabled until toggled.
         status, current = api("GET", f"/api/v1/functions/id/{func_id}", token=token)
         if 200 <= status < 300 and current and not current.get("is_active"):
             status, body = api("POST", f"/api/v1/functions/id/{func_id}/toggle", token=token)
@@ -188,15 +166,12 @@ def seed_functions(token: str) -> bool:
                 print(f"  activated function: {func_id}")
             else:
                 print(f"  FAILED to activate function {func_id}: {status} {body}")
-    return created_any
+                failed.append(func_id)
+    return created_any, failed
 
 
 def delete_obsolete(token: str) -> None:
-    """Removes entries from earlier layouts so the picker doesn't accumulate
-    stale duplicates across upgrades: pre-v0.4 Model presets (which break
-    outright once the Ollama connection is disabled, since a preset can't
-    resolve a base model that isn't listed) and v0.4's split-by-input-type
-    Functions (superseded by the combined ones)."""
+    """Removes presets and Functions left over from earlier layouts."""
     for preset_id in OBSOLETE_PRESETS:
         status, _ = api("GET", f"/api/v1/models/model?id={preset_id}", token=token)
         if not (200 <= status < 300):
@@ -221,15 +196,7 @@ def delete_obsolete(token: str) -> None:
 
 
 def disable_ollama_connection(token: str) -> None:
-    """Turns the Ollama connection off inside Open WebUI, which takes
-    TEXT_MODEL/VISION_MODEL out of the model picker.
-
-    This is safe only because every PromptHub entry is a Pipe Function that
-    POSTs to Ollama directly at OLLAMA_BASE_URL — none of them resolve
-    through Open WebUI's connection layer, so switching it off removes the
-    raw models from the picker without touching what they can call.
-    Verified both ways: with the connection off a Function still reaches
-    Ollama fine, while an old-style Model preset returns "Model not found"."""
+    """Hides the raw Ollama models from the picker; the Functions call Ollama directly, so they keep working."""
     status, config = api("GET", "/ollama/config", token=token)
     if not (200 <= status < 300) or not config:
         print(f"  FAILED to read Ollama config: {status} {config}")
@@ -252,11 +219,7 @@ def disable_ollama_connection(token: str) -> None:
 
 
 def disable_arena_model(token: str) -> None:
-    """Turns off Open WebUI's built-in Arena entry — the Evaluations feature
-    that pits two models against each other for blind rating. Newer releases
-    ship it enabled, where it shows up in the picker as a third entry
-    alongside PromptHub's two. Older releases have no such endpoint, so a
-    missing one is reported and skipped rather than treated as a failure."""
+    """Turns off Open WebUI's built-in Arena picker entry, where the release has one."""
     status, config = api("GET", "/api/v1/evaluations/config", token=token)
     if not (200 <= status < 300) or not isinstance(config, dict):
         print(f"  no evaluations config on this Open WebUI (status {status}) - nothing to disable")
@@ -275,23 +238,17 @@ def disable_arena_model(token: str) -> None:
 
 
 def sort_model_picker_alphabetically(token: str) -> None:
-    """Sets Open WebUI's admin-configurable MODEL_ORDER_LIST (the same
-    field behind Admin Settings -> Models' manual drag-to-reorder) to sort
-    every currently-visible model alphabetically by display name. Runs
-    last so newly (re)named entries are included, and re-derives the order
-    from whatever's visible each time —
-    so it stays correct if you add/remove/rename anything, including
-    models this repo doesn't know about."""
+    """Sets MODEL_ORDER_LIST to every visible model sorted by display name."""
     status, models = api("GET", "/api/models", token=token)
-    entries = models.get("data", models if isinstance(models, list) else []) if models else []
-    if not entries:
+    entries = models.get("data", []) if isinstance(models, dict) else (models if isinstance(models, list) else [])
+    if not (200 <= status < 300) or not entries:
         print(f"  FAILED to read model list: {status}")
         return
 
     order_ids = [m["id"] for m in sorted(entries, key=lambda m: (m.get("name") or "").casefold())]
 
     status, config = api("GET", "/api/v1/configs/models", token=token)
-    if not (200 <= status < 300) or config is None:
+    if not (200 <= status < 300) or not isinstance(config, dict):
         config = {}
     config["MODEL_ORDER_LIST"] = order_ids
 
@@ -304,10 +261,11 @@ def sort_model_picker_alphabetically(token: str) -> None:
 
 def main() -> None:
     print("== Seeding Open WebUI ==")
+    check_shared_helpers()
     token = get_token()
 
     print("-- Functions --")
-    created_new_function = seed_functions(token)
+    created_new_function, failed = seed_functions(token)
 
     print("-- Cleaning up older layouts --")
     delete_obsolete(token)
@@ -322,9 +280,11 @@ def main() -> None:
     sort_model_picker_alphabetically(token)
 
     if created_new_function:
-        # A brand-new function's frontmatter `requirements:` only get
-        # pip-installed on server startup, not at creation time.
+        # A new Function's `requirements:` are only pip-installed at server startup.
         print("NEEDS_RESTART")
+    if failed:
+        print(f"Seeding FAILED for: {', '.join(failed)}")
+        sys.exit(1)
     print("Done.")
 
 

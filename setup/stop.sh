@@ -8,12 +8,12 @@ PID_FILE="$HOME_DIR/openwebui.pid"
 if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
   pid="$(cat "$PID_FILE")"
   kill "$pid"
-  # Wait for it to actually exit: kill only sends the signal, and start.sh
-  # refuses to boot while anything is still answering on :8080.
   for _ in $(seq 1 20); do
     kill -0 "$pid" 2>/dev/null || break
     sleep 0.5
   done
+  # start.sh refuses to boot while the old process still holds :8080.
+  kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
   rm -f "$PID_FILE"
   echo "Stopped."
 else

@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# Starts Open WebUI in the background (macOS / Linux) and seeds it with
-# PromptHub's Pipe Functions via the API — no manual UI
-# steps. Safe to re-run any time (e.g. after editing a function/prompt).
+# Starts Open WebUI in the background (macOS / Linux) and seeds PromptHub's Functions; safe to re-run.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -12,47 +10,39 @@ LOG_FILE="$HOME_DIR/openwebui.log"
 
 [ -x "$VENV_DIR/bin/open-webui" ] || { echo "Run setup/install_<os>.sh first"; exit 1; }
 
+running() { [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; }
+serving() { curl -sf http://localhost:8080 >/dev/null 2>&1; }
+
 boot() {
-  if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-    return 0
+  if running; then
+    serving && return 0
+    echo "Open WebUI is already starting (pid $(cat "$PID_FILE")); waiting for it..."
+  else
+    # An untracked instance (e.g. pid file deleted with the home dir) would get seeded with its old database.
+    if serving; then
+      echo "Something is already serving http://localhost:8080, but it wasn't started"
+      echo "by this script. It is probably an Open WebUI left over from an earlier run,"
+      echo "still holding the old database. Close it and re-run this script:"
+      echo "  pkill -f open-webui"
+      return 1
+    fi
+
+    # Run from $HOME_DIR: Open WebUI writes files like .webui_secret_key into the working directory.
+    cd "$HOME_DIR"
+    DATA_DIR="$HOME_DIR/data" nohup "$VENV_DIR/bin/open-webui" serve --port 8080 >"$LOG_FILE" 2>&1 &
+    echo $! > "$PID_FILE"
+    echo "Waiting for Open WebUI to come up (first launch downloads an embedding"
+    echo "model and can take several minutes; later starts are much faster)..."
   fi
 
-  # Deleting the home directory also deletes the pid file, so an Open WebUI
-  # from an earlier run can still hold :8080 while being untracked here.
-  # Seeding would then silently target that stale instance and its old
-  # database — which looks exactly like seeding "not working" — so refuse to
-  # start rather than guess.
-  if curl -sf http://localhost:8080 >/dev/null 2>&1; then
-    echo "Something is already serving http://localhost:8080, but it wasn't started"
-    echo "by this script. It is probably an Open WebUI left over from an earlier run,"
-    echo "still holding the old database. Close it and re-run this script:"
-    echo "  pkill -f open-webui"
-    return 1
-  fi
-
-  # Run from $HOME_DIR, not the repo checkout: Open WebUI writes a couple of
-  # small files (e.g. .webui_secret_key) relative to the current directory,
-  # and those must never end up inside the git repo.
-  cd "$HOME_DIR"
-  DATA_DIR="$HOME_DIR/data" nohup "$VENV_DIR/bin/open-webui" serve --port 8080 >"$LOG_FILE" 2>&1 &
-  echo $! > "$PID_FILE"
-
-  # 5 minutes, not 2: the first launch after a clean install fetches the
-  # embedding model from Hugging Face, and on a slow link that alone can
-  # outlast a shorter timeout while the process is perfectly healthy.
-  echo "Waiting for Open WebUI to come up (first launch downloads an embedding"
-  echo "model and can take several minutes; later starts are much faster)..."
+  # 5 minutes: the first launch fetches an embedding model, which can be slow on a poor link.
   for i in $(seq 1 150); do
-    # Checked before the HTTP probe, not after: if our own process died (e.g.
-    # lost a race for the port) while something else answers on :8080, a
-    # successful probe would otherwise look like success.
-    if ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+    # Checked first, so another server answering on :8080 can't pass for ours after it died.
+    if ! running; then
       echo "Open WebUI process exited unexpectedly — check $LOG_FILE"
       return 1
     fi
-    if curl -sf http://localhost:8080 >/dev/null 2>&1; then
-      return 0
-    fi
+    serving && return 0
     if [ $((i % 15)) -eq 0 ]; then
       echo "  still starting ($((i * 2))s elapsed, process alive)..."
     fi
@@ -65,17 +55,16 @@ boot() {
 }
 
 stop() {
-  if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-    pid="$(cat "$PID_FILE")"
-    kill "$pid"
-    # Wait for it to actually exit rather than assuming a fixed sleep is
-    # enough: boot() below refuses to start while :8080 still answers.
-    for _ in $(seq 1 20); do
-      kill -0 "$pid" 2>/dev/null || break
-      sleep 0.5
-    done
-    rm -f "$PID_FILE"
-  fi
+  running || return 0
+  pid="$(cat "$PID_FILE")"
+  kill "$pid"
+  for _ in $(seq 1 20); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.5
+  done
+  # boot() refuses to start while the old process still holds :8080.
+  kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+  rm -f "$PID_FILE"
 }
 
 boot || exit 1

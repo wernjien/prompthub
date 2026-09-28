@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""Checks the running Open WebUI instance via its API: both Pipe
-Functions present, the raw Ollama models absent, and nothing unexpected in
-the model picker. Used by verify.sh / verify.ps1 so the acceptance
-criterion "the right models appear as selectable models" is automated
-rather than a manual checklist item.
-
-Prints PASS/FAIL lines and exits non-zero if anything is off.
-"""
+"""Checks the picker holds exactly PromptHub's Functions; prints PASS/FAIL and exits non-zero on failure."""
 
 import json
 import os
@@ -22,10 +15,10 @@ START_SCRIPT = "setup\\start.ps1" if os.name == "nt" else "setup/start.sh"
 
 EXPECTED_FUNCTIONS = ["krea2", "minimax_h3"]
 
-# Everything PromptHub installs is a Pipe Function now, so the picker
-# should contain these ten and nothing else — no Model presets, and no raw
-# Ollama models (the connection is disabled; see setup/seed.py).
-EXPECTED_ABSENT = ["dolphin3:8b", "llava:13b"]
+EXPECTED_ABSENT = [
+    os.environ.get("PROMPTHUB_TEXT_MODEL", "dolphin3:8b"),
+    os.environ.get("PROMPTHUB_VISION_MODEL", "llava:13b"),
+]
 
 
 def api(method: str, path: str, token: str = None, payload: dict = None):
@@ -46,8 +39,7 @@ def api(method: str, path: str, token: str = None, payload: dict = None):
 
 
 def _as_list(body) -> list:
-    """Open WebUI's list endpoints aren't consistent: /functions/list returns
-    a bare list, /models/list wraps it as {"items": [...]}. Handle both."""
+    """Accepts both a bare list and an {"items": [...]} wrapper, which Open WebUI endpoints mix."""
     if isinstance(body, list):
         return body
     if isinstance(body, dict):
