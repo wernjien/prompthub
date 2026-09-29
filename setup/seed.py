@@ -127,7 +127,7 @@ def _save_creds(email: str, password: str) -> None:
 
 def check_shared_helpers() -> None:
     """Warns when the helper block duplicated across the Function files has drifted."""
-    blocks = {path.name: path.read_text().partition(SHARED_HELPERS_MARKER)[2] for _, _, path in FUNCTIONS}
+    blocks = {path.name: path.read_text(encoding="utf-8").partition(SHARED_HELPERS_MARKER)[2] for _, _, path in FUNCTIONS}
     if len(set(blocks.values())) > 1:
         print(f"  WARNING: the shared helper block differs between {', '.join(blocks)}; keep it identical")
 
@@ -140,7 +140,7 @@ def seed_functions(token: str):
             "id": func_id,
             "name": name,
             "type": "pipe",
-            "content": path.read_text(),
+            "content": path.read_text(encoding="utf-8"),
             "meta": {"description": name, "manifest": {}},
             "is_active": True,
             "is_global": False,
