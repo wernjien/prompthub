@@ -1,18 +1,13 @@
 #!/usr/bin/env python3
 """Seeds a running Open WebUI through its REST API; safe to re-run after editing a Function."""
 
-import json
 import os
-import secrets
 import sys
-import urllib.error
-import urllib.request
 from pathlib import Path
 
+from owui import admin_token, api, ensure_login_saved
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
-BASE_URL = os.environ.get("PROMPTHUB_OPENWEBUI_URL", "http://localhost:8080")
-HOME_DIR = Path(os.environ.get("PROMPTHUB_HOME", str(Path.home() / "PromptHub")))
-CREDS_FILE = HOME_DIR / ".admin_credentials.json"
 TEXT_MODEL = os.environ.get("PROMPTHUB_TEXT_MODEL", "dolphin3:8b")
 VISION_MODEL = os.environ.get("PROMPTHUB_VISION_MODEL", "llava:13b")
 
@@ -50,79 +45,6 @@ OBSOLETE_FUNCTIONS = [
     "minimax_fl2va",
     "minimax_l2va",
 ]
-
-
-def api(method: str, path: str, token: str = None, payload: dict = None):
-    url = f"{BASE_URL}{path}"
-    data = json.dumps(payload).encode() if payload is not None else None
-    req = urllib.request.Request(url, data=data, method=method)
-    req.add_header("Content-Type", "application/json")
-    if token:
-        req.add_header("Authorization", f"Bearer {token}")
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            body = resp.read()
-            return resp.status, (json.loads(body) if body else None)
-    except urllib.error.HTTPError as exc:
-        body = exc.read()
-        try:
-            return exc.code, json.loads(body)
-        except json.JSONDecodeError:
-            return exc.code, body.decode(errors="replace")
-    except urllib.error.URLError as exc:
-        print(f"Could not reach Open WebUI at {BASE_URL}: {exc}")
-        sys.exit(1)
-
-
-def get_token() -> str:
-    HOME_DIR.mkdir(parents=True, exist_ok=True)
-
-    if CREDS_FILE.exists():
-        creds = json.loads(CREDS_FILE.read_text())
-        status, body = api("POST", "/api/v1/auths/signin", payload=creds)
-        if 200 <= status < 300:
-            return body["token"]
-        print(f"Saved admin credentials in {CREDS_FILE} no longer work (status {status}: {body}).")
-        print("Delete that file to force re-creating an account, or fix it by hand, then re-run.")
-        sys.exit(1)
-
-    env_email = os.environ.get("PROMPTHUB_ADMIN_EMAIL")
-    env_password = os.environ.get("PROMPTHUB_ADMIN_PASSWORD")
-    if env_email and env_password:
-        status, body = api("POST", "/api/v1/auths/signin", payload={"email": env_email, "password": env_password})
-        if 200 <= status < 300:
-            _save_creds(env_email, env_password)
-            return body["token"]
-
-    email = env_email or "admin@prompthub.local"
-    password = env_password or secrets.token_urlsafe(16)
-    status, body = api(
-        "POST",
-        "/api/v1/auths/signup",
-        payload={"email": email, "password": password, "name": "PromptHub Admin"},
-    )
-    if 200 <= status < 300:
-        _save_creds(email, password)
-        print(f"Created Open WebUI admin account: {email}")
-        print(f"Credentials saved to {CREDS_FILE} (used to seed on future runs too).")
-        print(f"Use the same email/password to log in at {BASE_URL} in your browser.")
-        return body["token"]
-
-    print(f"Signup failed (status {status}): {body}")
-    print(
-        "This usually means an admin account already exists from a previous run but "
-        f"{CREDS_FILE} is missing or stale. Set PROMPTHUB_ADMIN_EMAIL and "
-        "PROMPTHUB_ADMIN_PASSWORD to the existing account and re-run."
-    )
-    sys.exit(1)
-
-
-def _save_creds(email: str, password: str) -> None:
-    """Writes the credentials file owner-only from the moment it exists."""
-    fd = os.open(CREDS_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as fh:
-        fh.write(json.dumps({"email": email, "password": password}))
-    os.chmod(CREDS_FILE, 0o600)
 
 
 def check_shared_helpers() -> None:
@@ -262,7 +184,7 @@ def sort_model_picker_alphabetically(token: str) -> None:
 def main() -> None:
     print("== Seeding Open WebUI ==")
     check_shared_helpers()
-    token = get_token()
+    token = admin_token()
 
     print("-- Functions --")
     created_new_function, failed = seed_functions(token)
@@ -278,6 +200,8 @@ def main() -> None:
 
     print("-- Sorting model picker --")
     sort_model_picker_alphabetically(token)
+
+    ensure_login_saved(token)
 
     if created_new_function:
         # A new Function's `requirements:` are only pip-installed at server startup.

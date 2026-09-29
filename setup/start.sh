@@ -31,6 +31,7 @@ boot() {
     cd "$HOME_DIR"
     DATA_DIR="$HOME_DIR/data" nohup "$VENV_DIR/bin/open-webui" serve --port 8080 >"$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
+    disown  # so a later stop() kill isn't reported as "Terminated"
     echo "Waiting for Open WebUI to come up (first launch downloads an embedding"
     echo "model and can take several minutes; later starts are much faster)..."
   fi

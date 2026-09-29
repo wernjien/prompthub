@@ -41,11 +41,10 @@ your admin account, and deploys both Functions.
 **First run takes a while** — model downloads plus a one-off embedding
 model fetch. Later starts take seconds.
 
-**Don't open http://localhost:8080 until the script says it's done.** Open
-WebUI makes whoever signs up first the admin, so filling in that signup form
-by hand takes the slot the installer needs — it can then no longer sign in to
-deploy the two Functions, and you end up with an empty model picker. Wait for
-the login it prints below.
+It's easiest to leave http://localhost:8080 closed until the script is done.
+Open WebUI makes whoever signs up first the admin. If that's you in the
+browser, nothing breaks: PromptHub deploys into your account instead, and
+you log in with your own password.
 
 When it finishes it prints your login:
 
@@ -306,13 +305,21 @@ only PromptHub's entries. Ollama itself is untouched. Re-enable it in Admin
 Panel → Settings → Connections if you want it back (`setup/start.sh` will
 switch it off again).
 
-**Forgot the admin password.** It's in
-`~/PromptHub/.admin_credentials.json`.
+**Forgot the admin password.** For the generated `admin@prompthub.local`
+account it's in `~/PromptHub/.admin_credentials.json`. If that file is gone,
+run `./setup/start.sh` (Windows: `.\setup\start.ps1`): it notices, resets
+that account's password and saves the new one there. An account you created
+yourself is never reset; change its password in Open WebUI's settings.
 
-**The picker is empty — no Krea2 or MiniMax H3.** Seeding never got that
-far, usually because an admin account already existed (see the warning in
-§1) so the installer couldn't sign in to deploy them. Either point it at the
-account you already have:
+**Deploying doesn't need your password.** `setup/seed.py` signs in with Open
+WebUI's own key (`~/PromptHub/.webui_secret_key`) and database, which only
+someone on this machine can read. So a lost credentials file, or an account
+created in the browser first, no longer blocks it.
+
+**The picker is empty — no Krea2 or MiniMax H3.** Run `./setup/start.sh`
+again and read its output: it redeploys both Functions and says why if it
+can't. If Open WebUI keeps its data somewhere other than `~/PromptHub`,
+point the script at an admin account instead:
 
 ```powershell
 $env:PROMPTHUB_ADMIN_EMAIL = "you@example.com"
@@ -320,8 +327,8 @@ $env:PROMPTHUB_ADMIN_PASSWORD = "your-password"
 .\setup\start.ps1
 ```
 
-or start clean — stop it, delete the data, re-run the installer, and this
-time don't open the browser until it finishes:
+As a last resort, start clean: stop it, delete the data, and re-run the
+installer:
 
 ```powershell
 .\setup\stop.ps1
