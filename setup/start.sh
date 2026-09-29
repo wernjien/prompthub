@@ -29,7 +29,9 @@ boot() {
 
     # Run from $HOME_DIR: Open WebUI writes files like .webui_secret_key into the working directory.
     cd "$HOME_DIR"
-    DATA_DIR="$HOME_DIR/data" nohup "$VENV_DIR/bin/open-webui" serve --port 8080 >"$LOG_FILE" 2>&1 &
+    # Only a fresh database takes these; seed.py switches them off on an existing one.
+    DATA_DIR="$HOME_DIR/data" ENABLE_OLLAMA_API=False ENABLE_EVALUATION_ARENA_MODELS=False \
+      nohup "$VENV_DIR/bin/open-webui" serve --port 8080 >"$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
     disown  # so a later stop() kill isn't reported as "Terminated"
     echo "Waiting for Open WebUI to come up (first launch downloads an embedding"

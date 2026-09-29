@@ -305,6 +305,11 @@ only PromptHub's entries. Ollama itself is untouched. Re-enable it in Admin
 Panel → Settings → Connections if you want it back (`setup/start.sh` will
 switch it off again).
 
+**`dolphin3:8b`, `llava:13b` or "Arena Model" show up in the picker.** Open
+WebUI was started some other way than `./setup/start.sh` (Windows:
+`.\setup\start.ps1`), or the seed stopped early. Run the script, then reload
+the browser tab. A tab that was already open keeps the model list it loaded.
+
 **Forgot the admin password.** For the generated `admin@prompthub.local`
 account it's in `~/PromptHub/.admin_credentials.json`. If that file is gone,
 run `./setup/start.sh` (Windows: `.\setup\start.ps1`): it notices, resets
@@ -360,7 +365,9 @@ setup/       per-OS install + start/stop/seed/verify scripts
 
 `setup/seed.py` deploys everything through Open WebUI's REST API on every
 start: both Functions, removal of entries from earlier layouts, the Ollama
-connection switched off, and alphabetical picker order.
+connection and the built-in Arena Model switched off, and alphabetical picker
+order. The start scripts also launch Open WebUI with both off, so a fresh
+install never shows them.
 
 **Why Pipe Functions and not Open WebUI "Model presets"?** A preset resolves
 its base model through Open WebUI's connection layer, so `dolphin3:8b` had

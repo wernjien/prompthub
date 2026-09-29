@@ -186,17 +186,18 @@ def main() -> None:
     check_shared_helpers()
     token = admin_token()
 
-    print("-- Functions --")
-    created_new_function, failed = seed_functions(token)
-
-    print("-- Cleaning up older layouts --")
-    delete_obsolete(token)
-
+    # First, so a failure further down can't leave the raw models in the picker.
     print("-- Ollama connection --")
     disable_ollama_connection(token)
 
     print("-- Arena model --")
     disable_arena_model(token)
+
+    print("-- Functions --")
+    created_new_function, failed = seed_functions(token)
+
+    print("-- Cleaning up older layouts --")
+    delete_obsolete(token)
 
     print("-- Sorting model picker --")
     sort_model_picker_alphabetically(token)

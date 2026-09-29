@@ -36,6 +36,9 @@ function Start-OpenWebUI {
     }
 
     $env:DATA_DIR = "$HomeDir\data"
+    # Only a fresh database takes these; seed.py switches them off on an existing one.
+    $env:ENABLE_OLLAMA_API = "False"
+    $env:ENABLE_EVALUATION_ARENA_MODELS = "False"
     # WorkingDirectory = $HomeDir, not the repo checkout: Open WebUI writes
     # a couple of small files (e.g. .webui_secret_key) relative to the
     # current directory, and those must never end up inside the git repo.
