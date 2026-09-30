@@ -231,6 +231,22 @@ Open WebUI by hand); `start.sh` warns if they've drifted. Tests:
 change into the running instance. It's create-or-update, so re-running is
 always safe.
 
+**Checking prompt quality.** Before and after changing a system prompt or
+the writer model, run the eval against local Ollama:
+
+```bash
+~/PromptHub/venv/bin/python evals/run.py              # all cases
+~/PromptHub/venv/bin/python evals/run.py --case fl2va --repeat 3
+~/PromptHub/venv/bin/python evals/run.py --model qwen2.5:7b   # try another writer
+```
+
+It feeds the fixed inputs in `evals/cases.py` to the writer (a fixed scene
+description stands in for the vision model) and checks each output against
+the rules its system prompt states: word counts, the MiniMax field layout and
+alignment line, speaker IDs, no filler tags, negative phrasing or references
+to the attachment. Output varies run to run, so compare pass rates over a few
+`--repeat`s; every output is saved under `evals/results/` for diffing.
+
 ---
 
 ## 5. Configuration
@@ -367,6 +383,7 @@ Everything is local; the Functions talk to Ollama over `localhost:11434`.
 models/      the 2 Pipe Functions — each self-contained, prompt embedded inline
 shared/      helpers.py: source of the helper block embedded in each Function
 tests/       pytest suite
+evals/       prompt-quality eval against local Ollama
 setup/       per-OS install + start/stop/seed/verify scripts
 ```
 

@@ -8,3 +8,4 @@ venv/
 .webui_secret_key
 .pytest_cache/
 .ruff_cache/
+evals/results/
