@@ -11,6 +11,7 @@ import asyncio
 import base64
 import glob
 import inspect
+import json
 import os
 import re
 import shutil
@@ -18,7 +19,7 @@ import subprocess
 import tempfile
 import time
 import uuid
-from typing import List, Optional, Tuple
+from typing import Callable, Iterator, List, Optional, Tuple
 
 import requests
 from pydantic import BaseModel
@@ -106,15 +107,14 @@ class Pipe:
         self.name = "Krea2"
         self.valves = self.Valves()
 
-    async def pipe(self, body: dict, __files__: Optional[list] = None, __task__: Optional[str] = None) -> str:
+    async def pipe(self, body: dict, __files__: Optional[list] = None, __task__: Optional[str] = None):
         # Title/tag/follow-up jobs are routed here too; "" makes Open WebUI fall back without an LLM run.
         if __task__:
             return ""
         videos, image_paths, unresolved = await resolve_attachments(__files__)
-        # Open WebUI awaits pipes on its event loop, so the blocking work runs in a thread.
-        return await asyncio.to_thread(self._run, body, videos, image_paths, unresolved)
+        return stream_in_thread(self._run, body, videos, image_paths, unresolved)
 
-    def _run(self, body: dict, videos: List[str], image_paths: List[str], unresolved: str) -> str:
+    def _run(self, body: dict, videos: List[str], image_paths: List[str], unresolved: str) -> Iterator[str]:
         v = self.valves
         text = extract_user_text(body)
         images, inline_problem = extract_images_b64(body)
@@ -122,23 +122,30 @@ class Pipe:
             len(videos), len(images) + len(image_paths), "; ".join(p for p in (unresolved, inline_problem) if p)
         )
         if problem:
-            return problem
+            yield problem
+            return
         if not text and not images and not image_paths and not videos:
-            return "⚠️ " + EMPTY_INPUT_HINT
+            yield "⚠️ " + EMPTY_INPUT_HINT
+            return
 
         video = videos[0] if videos else None
         workdir = tempfile.mkdtemp(prefix="prompthub_")
+        streamed = False
         try:
             images += [file_to_b64(p) for p in image_paths]
             caption, _, _, _ = caption_attachments(
                 v, video, images, VISION_INSTRUCTION_VIDEO, VISION_INSTRUCTION_IMAGE, workdir
             )
             idea = build_idea(text, caption, None)
-            return tidy_output(ollama_generate(
+            chunks = ollama_stream(
                 v.OLLAMA_BASE_URL, v.TEXT_MODEL, SYSTEM_PROMPT, idea, v.REQUEST_TIMEOUT_SECONDS, v.TEXT_NUM_CTX
-            ))
+            )
+            for piece in stream_transformed(chunks, tidy_output):
+                streamed = True
+                yield piece
         except PIPELINE_ERRORS as exc:
-            return pipeline_error(exc, bool(video or images))
+            yield ("\n\n" if streamed else "") + pipeline_error(exc, bool(video or images))
+            return
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
 
@@ -527,15 +534,82 @@ def _ollama_generate(base_url: str, payload: dict, timeout: int, num_ctx: int) -
         payload["options"] = {"num_ctx": num_ctx}
     resp = requests.post(f"{base_url.rstrip('/')}/api/generate", json=payload, timeout=timeout)
     if not resp.ok:
-        try:
-            detail = resp.json().get("error") or resp.text
-        except ValueError:
-            detail = resp.text
-        raise RuntimeError(f"Ollama returned {resp.status_code} for {payload['model']}: {detail.strip()[:300]}")
+        raise RuntimeError(_ollama_error(resp, payload["model"]))
     text = (resp.json().get("response") or "").strip()
     if not text:
         raise RuntimeError(f"{payload['model']} returned an empty response")
     return text
+
+
+def _ollama_error(resp: requests.Response, model: str) -> str:
+    """Formats a failed Ollama response, preferring Ollama's own error text."""
+    try:
+        detail = resp.json().get("error") or resp.text
+    except ValueError:
+        detail = resp.text
+    return f"Ollama returned {resp.status_code} for {model}: {detail.strip()[:300]}"
+
+
+def ollama_stream(
+    base_url: str, model: str, system: str, prompt: str, timeout: int, num_ctx: int = 0
+) -> Iterator[str]:
+    """Yields the writer's text as Ollama generates it."""
+    payload = {"model": model, "system": system, "prompt": prompt, "stream": True}
+    if num_ctx:
+        payload["options"] = {"num_ctx": num_ctx}
+    got_text = False
+    with requests.post(f"{base_url.rstrip('/')}/api/generate", json=payload, timeout=timeout, stream=True) as resp:
+        if not resp.ok:
+            raise RuntimeError(_ollama_error(resp, model))
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            data = json.loads(line)
+            if data.get("error"):
+                raise RuntimeError(f"Ollama failed mid-response for {model}: {str(data['error'])[:300]}")
+            piece = data.get("response") or ""
+            got_text = got_text or bool(piece.strip())
+            if piece:
+                yield piece
+            if data.get("done"):
+                break
+    if not got_text:
+        raise RuntimeError(f"{model} returned an empty response")
+
+
+# Covers the longest edit a transform makes near the end: a leading "Alignment Instruction:" or "the image's".
+STREAM_HOLDBACK = 40
+
+
+def stream_transformed(chunks: Iterator[str], transform: Callable[[str], str]) -> Iterator[str]:
+    """Yields transform(full text) as it grows, holding back a tail the transform may still rewrite."""
+    raw, sent = "", ""
+    for chunk in chunks:
+        raw += chunk
+        safe = transform(raw)[:-STREAM_HOLDBACK]
+        if len(safe) > len(sent) and safe.startswith(sent):
+            yield safe[len(sent):]
+            sent = safe
+    final = transform(raw)
+    rest = final[len(os.path.commonprefix([sent, final])):]
+    if rest:
+        yield rest
+
+
+async def stream_in_thread(make: Callable[..., Iterator[str]], *args):
+    """Drives a blocking generator from a worker thread so Open WebUI's event loop stays free."""
+    gen, done = make(*args), object()
+    try:
+        while True:
+            chunk = await asyncio.to_thread(next, gen, done)
+            if chunk is done:
+                return
+            yield chunk
+    finally:
+        try:
+            gen.close()
+        except ValueError:
+            pass
 
 
 def pipeline_error(exc: Exception, had_attachment: bool) -> str:

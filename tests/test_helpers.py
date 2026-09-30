@@ -168,3 +168,70 @@ def test_ollama_vision_sends_images_without_ctx_when_zero(helpers, monkeypatch):
     )
     helpers.ollama_vision("http://h", "v", "look", ["QUJD"], 5)
     assert seen["json"]["images"] == ["QUJD"] and "options" not in seen["json"]
+
+
+class _StreamResp(_Resp):
+    def __init__(self, lines, ok=True, status=200, data=None):
+        super().__init__(ok, status, data)
+        self._lines = lines
+
+    def iter_lines(self):
+        return iter(self._lines)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_ollama_stream_yields_pieces(helpers, monkeypatch):
+    lines = [b'{"response": "A "}', b"", b'{"response": "fox"}', b'{"done": true}', b'{"response": "late"}']
+    seen = {}
+    monkeypatch.setattr(helpers.requests, "post", lambda url, **k: seen.update(k) or _StreamResp(lines))
+    assert list(helpers.ollama_stream("http://h", "m", "s", "p", 5, 2048)) == ["A ", "fox"]
+    assert seen["stream"] is True and seen["json"]["stream"] is True and seen["json"]["options"] == {"num_ctx": 2048}
+
+
+def test_ollama_stream_errors(helpers, monkeypatch):
+    monkeypatch.setattr(helpers.requests, "post", lambda *a, **k: _StreamResp([], False, 404, {"error": "no model"}))
+    with pytest.raises(RuntimeError, match="404 for m: no model"):
+        list(helpers.ollama_stream("http://h", "m", "s", "p", 5))
+    monkeypatch.setattr(helpers.requests, "post", lambda *a, **k: _StreamResp([b'{"error": "oom"}']))
+    with pytest.raises(RuntimeError, match="mid-response for m: oom"):
+        list(helpers.ollama_stream("http://h", "m", "s", "p", 5))
+    monkeypatch.setattr(helpers.requests, "post", lambda *a, **k: _StreamResp([b'{"response": " "}', b'{"done": true}']))
+    with pytest.raises(RuntimeError, match="empty response"):
+        list(helpers.ollama_stream("http://h", "m", "s", "p", 5))
+
+
+@pytest.mark.parametrize("text", [
+    "```text\n" + "A long prompt about a fox in the snow. " * 5 + "\n```",
+    "Alignment Instruction: " + "For the target video, the image's edge glows. " * 4,
+    "short",
+    "x" * 200,
+])
+@pytest.mark.parametrize("size", [1, 3, 17])
+def test_stream_transformed_matches_whole_text_transform(helpers, text, size):
+    transform = helpers.tidy_output
+    chunks = [text[i:i + size] for i in range(0, len(text), size)]
+    pieces = list(helpers.stream_transformed(iter(chunks), transform))
+    assert "".join(pieces) == transform(text)
+    if len(text) > 100:
+        assert len(pieces) > 1
+
+
+def test_stream_in_thread_yields_and_closes(helpers):
+    closed = []
+
+    def gen(n):
+        try:
+            yield from (str(i) for i in range(n))
+        finally:
+            closed.append(True)
+
+    async def collect():
+        return [c async for c in helpers.stream_in_thread(gen, 3)]
+
+    import asyncio
+    assert asyncio.run(collect()) == ["0", "1", "2"] and closed == [True]
