@@ -1,13 +1,5 @@
-"""
-title: Krea2
-author: PromptHub
-version: 0.7.0
-license: MIT
-description: Writes a Krea 2 image prompt from typed text, an attached image or clip, or both, via local Ollama.
-requirements: requests
-"""
+"""Source of truth for the helper block embedded at the end of each models/*.py Function."""
 
-import asyncio
 import base64
 import glob
 import inspect
@@ -15,133 +7,11 @@ import os
 import re
 import shutil
 import subprocess
-import tempfile
 import time
 import uuid
 from typing import List, Optional, Tuple
 
 import requests
-from pydantic import BaseModel
-
-SYSTEM_PROMPT = """You are a prompt writer for Krea 2, an image generation model. Your only job is to turn the input into one high-quality image prompt. Krea 2 reads natural descriptive language: never use comma-separated tags, (word:1.3) weighting syntax, or a separate negative-prompt section.
-
-INPUT
-The input contains a MY INTENT section, SCENE DETAILS observed from a reference, or both. MY INTENT decides what the image depicts; the scene details supply concrete specifics (subject, setting, lighting, angle, palette, style) for the elements they describe. Merge them into one coherent scene and never contradict MY INTENT: for "same scene but at night", keep the described subject and setting and relight them for night. If only scene details are given, write the prompt that recreates that scene.
-
-The prompt is pasted into a generator that cannot see any reference, so it must stand on its own. Never refer to a reference, image, picture, attachment or upload ("the image shows", "as depicted", "in the provided photo"), and never comment on resolution, blur or image quality. Describe the scene itself. Naming the medium as a style ("a street photograph", "an oil painting") is fine.
-
-OUTPUT RULES
-- Output ONLY the final prompt: no preamble, explanation, headings, markdown or surrounding quotes.
-- One flowing paragraph of natural descriptive sentences.
-- 50-120 words. Go shorter for simple ideas; never pad.
-- Write in English, even if the input is in another language.
-
-STRUCTURE (in this order)
-1. Subject: who or what, with defining physical details. Always first.
-2. Action or pose: what the subject is doing, expression, body language.
-3. Setting: location, environment, time of day, background elements.
-4. Lighting: always name the source, direction and quality (e.g. "low golden-hour sun raking from the left", "single tungsten lamp casting deep shadows").
-5. Camera: shot type, angle, lens and depth of field (e.g. "close-up at eye level, 85mm lens, shallow depth of field"). For non-photographic styles, use composition and framing terms instead.
-6. Style and medium: photograph, film stock, oil painting, 3D render, anime, etc.
-7. Color palette and mood: concrete colors and the emotional tone.
-
-QUALITY PRINCIPLES
-- Be specific about materials and textures (brushed steel, linen with visible weave, skin with pores and freckles); this is where realism comes from.
-- For photorealistic requests, aim for an authentic, non-AI look: candid framing, natural skin texture, real-world imperfections, believable backgrounds.
-- Tie every attribute to its object so details don't bleed together: "a woman in a red coat holding a blue umbrella", not "woman, red, blue, coat, umbrella".
-- Keep the scene focused on 3-5 key elements; if the input is overloaded, keep the ones that matter most to MY INTENT.
-- Keep every detail consistent: never pair night with bright sunlight, or minimalist with a crowded scene.
-
-NEVER
-- Quality tags or filler: "masterpiece", "best quality", "8k", "ultra HD", "highly detailed", "trending on artstation", "award-winning".
-- Negative phrasing ("no people", "without text"). Describe what IS there instead ("an empty street", "a plain unmarked wall").
-- Text or lettering in the scene unless MY INTENT asks for it or the scene details include it.
-
-TEXT IN THE SCENE
-- When there is text, put the exact words in double quotes and say where and how they appear, e.g. a hand-painted sign reading "OPEN LATE" above the door.
-
-RESPECTING THE USER
-- Keep everything MY INTENT specifies (style, colors, composition, subject details); only fill in what it leaves open.
-- If a style is named (anime, watercolor, pixel art, etc.), commit to it fully and use that medium's vocabulary instead of camera terms.
-- If the idea is vague, make confident, tasteful creative choices; never ask questions.
-- If the user asks for variations, output that many prompts as separate paragraphs divided by a blank line, varying lighting, angle or setting while keeping the core subject.
-
-EXAMPLE 1
-Input: MY INTENT: old woman at a market
-Output: A candid street photograph of an elderly woman laughing at a fruit stall in a Lisbon market, her silver hair tied back and a knitted cardigan over her shoulders. Late afternoon sun filters through a striped canvas awning, casting warm dappled light across her face and the crates of oranges beside her. Shot at eye level with a 35mm lens and shallow depth of field, natural skin texture, subtle film grain, muted warm palette with soft oranges and faded blues.
-
-EXAMPLE 2
-Input: MY INTENT: same scene but at night, in the rain
-SCENE DETAILS: A young man in a yellow raincoat rides a bicycle along a canal lined with brick houses. Bright midday sun, clear blue sky, wide shot from street level, realistic style.
-Output: A young man in a yellow raincoat pedals a bicycle along a narrow canal lined with old brick houses, his hood up and shoulders hunched against the weather. Steady night rain streaks through the glow of iron streetlamps, their warm light rippling across wet cobblestones and the black water beside him. Wide shot from street level with a 28mm lens and deep depth of field, a realistic photograph with glistening reflections and rain-beaded fabric, palette of amber, deep navy and saturated yellow, quiet and melancholy."""
-
-VISION_INSTRUCTION_IMAGE = "Describe this image in detail: main subject and action, setting/background, materials and textures, lighting direction and quality, apparent camera angle or lens characteristics, color palette, overall style, and any visible text quoted exactly."
-
-VISION_INSTRUCTION_VIDEO = "These frames are sampled in order across a short clip. Describe the scene in detail: main subject and action, setting/background, materials and textures, lighting, camera angle or lens characteristics, color palette, overall style, and any visible text quoted exactly."
-
-EMPTY_INPUT_HINT = "Type the scene you want, attach an image, or both — then send."
-
-
-class Pipe:
-    class Valves(BaseModel):
-        OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-        VISION_MODEL: str = os.getenv("PROMPTHUB_VISION_MODEL", "llava:13b")
-        TEXT_MODEL: str = os.getenv("PROMPTHUB_TEXT_MODEL", "dolphin3:8b")
-        FFMPEG_BINARY: str = os.getenv("PROMPTHUB_FFMPEG_BINARY", "ffmpeg")
-        FFPROBE_BINARY: str = os.getenv("PROMPTHUB_FFPROBE_BINARY", "ffprobe")
-        # llava:13b fails past ~5 images (~576 tokens each of a 4096 budget); the final frame is one of them.
-        FRAME_COUNT: int = int(os.getenv("PROMPTHUB_FRAME_COUNT", "4"))
-        MAX_VISION_IMAGES: int = int(os.getenv("PROMPTHUB_MAX_VISION_IMAGES", "5"))
-        # Ollama clamps this to the model's own limit (4096 for llava:13b).
-        VISION_NUM_CTX: int = int(os.getenv("PROMPTHUB_VISION_NUM_CTX", "8192"))
-        # Ollama silently truncates prompts that overflow its default context.
-        TEXT_NUM_CTX: int = int(os.getenv("PROMPTHUB_TEXT_NUM_CTX", "8192"))
-        REQUEST_TIMEOUT_SECONDS: int = int(os.getenv("PROMPTHUB_REQUEST_TIMEOUT_SECONDS", "300"))
-        REFERENCE_FRAME_DIR: str = os.getenv(
-            "PROMPTHUB_REFERENCE_FRAME_DIR", os.path.expanduser("~/PromptHub/output")
-        )
-
-    def __init__(self):
-        self.id = "krea2"
-        self.name = "Krea2"
-        self.valves = self.Valves()
-
-    async def pipe(self, body: dict, __files__: Optional[list] = None, __task__: Optional[str] = None) -> str:
-        # Title/tag/follow-up jobs are routed here too; "" makes Open WebUI fall back without an LLM run.
-        if __task__:
-            return ""
-        videos, image_paths, unresolved = await resolve_attachments(__files__)
-        # Open WebUI awaits pipes on its event loop, so the blocking work runs in a thread.
-        return await asyncio.to_thread(self._run, body, videos, image_paths, unresolved)
-
-    def _run(self, body: dict, videos: List[str], image_paths: List[str], unresolved: str) -> str:
-        v = self.valves
-        text = extract_user_text(body)
-        images, inline_problem = extract_images_b64(body)
-        problem = attachment_problem(
-            len(videos), len(images) + len(image_paths), "; ".join(p for p in (unresolved, inline_problem) if p)
-        )
-        if problem:
-            return problem
-        if not text and not images and not image_paths and not videos:
-            return "⚠️ " + EMPTY_INPUT_HINT
-
-        video = videos[0] if videos else None
-        workdir = tempfile.mkdtemp(prefix="prompthub_")
-        try:
-            images += [file_to_b64(p) for p in image_paths]
-            caption, _, _, _ = caption_attachments(
-                v, video, images, VISION_INSTRUCTION_VIDEO, VISION_INSTRUCTION_IMAGE, workdir
-            )
-            idea = build_idea(text, caption, None)
-            return tidy_output(ollama_generate(
-                v.OLLAMA_BASE_URL, v.TEXT_MODEL, SYSTEM_PROMPT, idea, v.REQUEST_TIMEOUT_SECONDS, v.TEXT_NUM_CTX
-            ))
-        except PIPELINE_ERRORS as exc:
-            return pipeline_error(exc, bool(video or images))
-        finally:
-            shutil.rmtree(workdir, ignore_errors=True)
-
 
 # --- shared helpers: generated from shared/helpers.py by setup/sync_shared.py; edit it there ---
 

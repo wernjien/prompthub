@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 from owui import admin_token, api, ensure_login_saved
+from sync_shared import drifted
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TEXT_MODEL = os.environ.get("PROMPTHUB_TEXT_MODEL", "dolphin3:8b")
@@ -16,8 +17,6 @@ FUNCTIONS = [
     ("krea2", "Krea2", REPO_ROOT / "models" / "krea2.py"),
     ("minimax_h3", "MiniMax H3", REPO_ROOT / "models" / "minimax_h3.py"),
 ]
-
-SHARED_HELPERS_MARKER = "# --- shared helpers"
 
 # Pre-v0.4 Model presets, deleted so they don't linger as broken picker entries.
 OBSOLETE_PRESETS = [
@@ -48,10 +47,9 @@ OBSOLETE_FUNCTIONS = [
 
 
 def check_shared_helpers() -> None:
-    """Warns when the helper block duplicated across the Function files has drifted."""
-    blocks = {path.name: path.read_text(encoding="utf-8").partition(SHARED_HELPERS_MARKER)[2] for _, _, path in FUNCTIONS}
-    if len(set(blocks.values())) > 1:
-        print(f"  WARNING: the shared helper block differs between {', '.join(blocks)}; keep it identical")
+    """Warns when a Function's helper block no longer matches shared/helpers.py."""
+    for path in drifted():
+        print(f"  WARNING: {path.name} is out of sync with shared/helpers.py; run setup/sync_shared.py")
 
 
 def seed_functions(token: str):

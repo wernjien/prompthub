@@ -363,7 +363,7 @@ class Pipe:
         return final_prompt + reference_footer(refs, policy) + note
 
 
-# --- shared helpers: keep identical across models/*.py (Functions can't import each other) ---
+# --- shared helpers: generated from shared/helpers.py by setup/sync_shared.py; edit it there ---
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v", ".mpg", ".mpeg"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}

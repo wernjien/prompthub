@@ -222,6 +222,11 @@ the format requires naming them.
 Nothing runs at boot — Open WebUI only runs while you've started it. Ollama
 runs as a background service from its own installer.
 
+**Edited `shared/helpers.py`?** Run `python3 setup/sync_shared.py` to copy it
+into both Functions (they stay self-contained so they can be pasted into
+Open WebUI by hand); `start.sh` warns if they've drifted. Tests:
+`pip install -r requirements-dev.txt && pytest`.
+
 **Edited a prompt in `models/*.py`?** Run `./setup/start.sh` to push the
 change into the running instance. It's create-or-update, so re-running is
 always safe.
@@ -360,6 +365,8 @@ Everything is local; the Functions talk to Ollama over `localhost:11434`.
 
 ```
 models/      the 2 Pipe Functions — each self-contained, prompt embedded inline
+shared/      helpers.py: source of the helper block embedded in each Function
+tests/       pytest suite
 setup/       per-OS install + start/stop/seed/verify scripts
 ```
 
