@@ -7,6 +7,8 @@ $OutputDir = "$HomeDir\output"
 $VenvDir = "$HomeDir\venv"
 $TextModel = if ($env:PROMPTHUB_TEXT_MODEL) { $env:PROMPTHUB_TEXT_MODEL } else { "dolphin3:8b" }
 $VisionModel = if ($env:PROMPTHUB_VISION_MODEL) { $env:PROMPTHUB_VISION_MODEL } else { "llava:13b" }
+# seed.py uses Open WebUI's internal API, so the version is pinned to the one it was tested against.
+$OpenWebUIVersion = if ($env:PROMPTHUB_OPENWEBUI_VERSION) { $env:PROMPTHUB_OPENWEBUI_VERSION } else { "0.11.3" }
 
 # winget updates the machine/user PATH in the registry, but this process's
 # $env:Path is a snapshot taken at startup - without refreshing it here,
@@ -60,7 +62,7 @@ Write-Host "==> Creating Python venv at $VenvDir"
 New-Item -ItemType Directory -Force -Path $HomeDir, $OutputDir | Out-Null
 py -3.11 -m venv $VenvDir
 & "$VenvDir\Scripts\pip.exe" install --upgrade pip | Out-Null
-& "$VenvDir\Scripts\pip.exe" install open-webui
+& "$VenvDir\Scripts\pip.exe" install "open-webui==$OpenWebUIVersion"
 
 Write-Host "==> Starting Open WebUI and seeding PromptHub Functions"
 $RepoRoot = Split-Path -Parent $PSScriptRoot

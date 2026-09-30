@@ -7,6 +7,8 @@ OUTPUT_DIR="$HOME_DIR/output"
 VENV_DIR="$HOME_DIR/venv"
 TEXT_MODEL="${PROMPTHUB_TEXT_MODEL:-dolphin3:8b}"
 VISION_MODEL="${PROMPTHUB_VISION_MODEL:-llava:13b}"
+# seed.py uses Open WebUI's internal API, so the version is pinned to the one it was tested against.
+OPENWEBUI_VERSION="${PROMPTHUB_OPENWEBUI_VERSION:-0.11.3}"
 
 echo "==> Installing Ollama"
 if ! command -v ollama >/dev/null; then
@@ -56,7 +58,7 @@ echo "==> Creating Python venv at $VENV_DIR (using $PYBIN)"
 mkdir -p "$HOME_DIR" "$OUTPUT_DIR"
 "$PYBIN" -m venv "$VENV_DIR"
 "$VENV_DIR/bin/pip" install --upgrade pip >/dev/null
-"$VENV_DIR/bin/pip" install open-webui
+"$VENV_DIR/bin/pip" install "open-webui==$OPENWEBUI_VERSION"
 
 echo "==> Starting Open WebUI and seeding PromptHub Functions"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

@@ -417,9 +417,12 @@ the four MiniMax modes are inferred rather than being separate entries.
   Treat it like any local secret; set `PROMPTHUB_ADMIN_PASSWORD` yourself
   if the machine is shared.
 - **Setup uses Open WebUI's internal API**, which carries no stability
-  guarantee. `setup/seed.py` fails loudly with the exact HTTP status if a
-  future release changes it — the fallback is pasting `models/*.py` into
-  Admin Panel → Functions by hand.
+  guarantee, so the installers pin Open WebUI to the tested version
+  (0.11.3). To try a newer one, set `PROMPTHUB_OPENWEBUI_VERSION` before
+  installing, or run `~/PromptHub/venv/bin/pip install open-webui==<version>`.
+  `setup/seed.py` fails loudly with the exact HTTP status if a release
+  changes the API — the fallback is pasting `models/*.py` into Admin Panel →
+  Functions by hand.
 - **Prompt conventions may drift.** The MiniMax prompts follow MiniMax's
   own [H3 prompt-writing guide](https://github.com/MiniMax-AI/MiniMax-H3/blob/main/skills/h3-prompt-writing/references/base-en.txt)
   (field names, alignment lines, camera vocabulary, speaker tags). The
